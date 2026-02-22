@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Prompt Firewall",
+  "version": "0.3.2",
+  "description": "Redacts PII, detects prompt injection, and routes through optional proxy hops before sending to GenAI chat inputs.",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["https://*/*", "http://*/*", "https://generativelanguage.googleapis.com/*"],
+  "storage": {
+    "managed_schema": "schema.json"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://*/*", "http://*/*"],
+      "js": ["content_script.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
