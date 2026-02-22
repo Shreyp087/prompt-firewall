@@ -7,6 +7,12 @@ document.querySelectorAll(".tab-btn").forEach((btn) => {
     if (btn.dataset.tab === "vault") loadVault();
     if (btn.dataset.tab === "audit") loadAudit();
     if (btn.dataset.tab === "enterprise") loadEnterprise();
+    // Particle background: enabled on all tabs except Policy.
+    try {
+      window.pfParticles?.setEnabled?.(btn.dataset.tab !== "policy");
+    } catch {
+      // no-op
+    }
   });
 });
 
@@ -69,6 +75,14 @@ init().catch(() => setStatus("Failed to load options.", true));
 async function init() {
   const versionEl = document.getElementById("pf-version");
   if (versionEl) versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+
+  // Ensure particle bg state matches initial active tab.
+  try {
+    const activeTab = document.querySelector(".tab-btn.active")?.dataset?.tab || "policy";
+    window.pfParticles?.setEnabled?.(activeTab !== "policy");
+  } catch {
+    // no-op
+  }
 
   const [policyResp, packsResp] = await Promise.all([
     sendMsg({ type: "POLICY_GET" }),
@@ -162,7 +176,7 @@ async function loadEnterprise() {
 function renderEnterpriseForm() {
   const ent = state.enterprise || {};
   els.enterpriseEnabled.checked = Boolean(ent.enabled);
-  els.enterpriseGeminiModel.value = String(ent.gemini?.model || "gemini-1.5-flash");
+  els.enterpriseGeminiModel.value = String(ent.gemini?.model || "auto");
   els.enterpriseKeyHint.textContent = ent.gemini?.apiKeyPresent ? "API key saved" : "No API key saved";
 
   const policies = Array.isArray(ent.policies) ? ent.policies : [];
@@ -199,7 +213,7 @@ function collectEnterpriseFromForm() {
   ent.enabled = Boolean(els.enterpriseEnabled.checked);
   ent.gemini = {
     ...(ent.gemini || {}),
-    model: String(els.enterpriseGeminiModel.value || "gemini-1.5-flash").trim(),
+    model: String(els.enterpriseGeminiModel.value || "auto").trim(),
   };
 
   const apiKey = String(els.enterpriseGeminiKey.value || "").trim();

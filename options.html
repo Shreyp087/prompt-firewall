@@ -5,28 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>Prompt Firewall — Options</title>
   <link rel="stylesheet" href="styles.css"/>
-  <style>
-    .tab-bar { display:flex; flex-wrap:wrap; gap:4px; border-bottom:2px solid rgba(148, 163, 184, 0.35); margin-bottom:20px; }
-    .tab-btn { padding:8px 16px; border:0; background:transparent; cursor:pointer; font-weight:600; font-size:13px; color:#94a3b8; border-bottom:2px solid transparent; margin-bottom:-2px; transition:color .15s, border-color .15s; }
-    .tab-btn.active { color:#e5e7eb; border-bottom-color:#22d3ee; }
-    .tab-panel { display:none; }
-    .tab-panel.active { display:block; }
-    .proxy-hop { background:#0b1220; border:1px solid rgba(148, 163, 184, 0.35); border-radius:10px; padding:12px; margin-bottom:10px; position:relative; }
-    .proxy-hop-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; font-weight:600; font-size:13px; }
-    .hop-remove { border:0; background:rgba(239, 68, 68, 0.25); color:#fecaca; border-radius:6px; padding:3px 8px; cursor:pointer; font-size:11px; }
-    .hop-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    .hop-grid-full { grid-column: 1 / -1; }
-    .hop-status { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; }
-    .hop-ok   { background:rgba(16, 185, 129, 0.24); color:#bbf7d0; }
-    .hop-fail { background:rgba(239, 68, 68, 0.25); color:#fecaca; }
-    .hop-pend { background:rgba(2, 132, 199, 0.25); color:#e0f2fe; }
-    .vault-item { display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(15, 23, 42, 0.45); border:1px solid rgba(148, 163, 184, 0.25); border-radius:8px; margin-bottom:6px; font-size:12px; }
-    .risk-bar-wrap { background:rgba(148, 163, 184, 0.25); border-radius:999px; height:6px; margin-top:4px; }
-    .risk-bar { height:6px; border-radius:999px; background:#22d3ee; }
-    code { background:rgba(15, 23, 42, 0.65); padding:1px 6px; border-radius:6px; border:1px solid rgba(148, 163, 184, 0.25); }
-  </style>
 </head>
 <body class="options-body">
+  <canvas id="pf-bg" aria-hidden="true"></canvas>
   <main class="options-shell">
     <header class="panel-head">
       <div>
@@ -219,15 +200,15 @@
       </section>
 
       <section class="card">
-        <h2>Gemini API</h2>
+        <h2>Policy LLM API (Gemini or OpenAI)</h2>
         <div class="grid two">
           <label>
             <span>Model</span>
-            <input id="enterprise-gemini-model" type="text" placeholder="gemini-1.5-flash"/>
+            <input id="enterprise-gemini-model" type="text" placeholder="auto (Gemini) or gpt-4o-mini"/>
           </label>
           <label>
             <span>API key</span>
-            <input id="enterprise-gemini-key" type="password" placeholder="Paste Gemini API key (saved locally)"/>
+            <input id="enterprise-gemini-key" type="password" placeholder="Paste Gemini or OpenAI API key (saved locally)"/>
           </label>
         </div>
         <div class="actions">
@@ -249,6 +230,7 @@
       </section>
     </div>
   </main>
+  <script src="particles_bg.js"></script>
   <script src="options.js"></script>
 </body>
 </html>

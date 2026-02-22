@@ -1,4 +1,4 @@
-import { getEffectivePolicy } from "./src/lib/policy/effectivePolicy.js";
+import { getEffectivePolicy } from "./effectivePolicy.js";
 
 const LEDGER_LIMIT = 400;
 const STRICT_DEFAULT_DOMAINS = [
@@ -70,10 +70,35 @@ const DEFAULT_ENTERPRISE = {
   ],
   gemini: {
     apiKey: "",
-    model: "gemini-1.5-flash",
+    model: "auto",
     temperature: 0.2,
   },
 };
+
+const AUTOMATION_WINDOW_MS = 5000;
+const AUTOMATION_BURST_THRESHOLD = 4;
+const PASTE_SEND_TOO_FAST_MS = 250;
+const L1_STEPUP_HOLD_MS = 1200;
+const STEPUP_LAST_CHALLENGE_KEY = "stepup_last_challenge";
+const L2_CHALLENGE_POOL = ["OTP", "SLIDER", "HOLD"];
+const L2_SENSITIVE_CATEGORIES = ["PRIVATE_KEY", "SECRET", "JWT", "SSN", "FINANCIAL"];
+const REASON_SEVERITY_RANK = { LOW: 1, MED: 2, HIGH: 3 };
+const REASON_MAP = {
+  PRIVATE_KEY: { code: "PRIVATE_KEY", label: "Private key detected", severity: "HIGH" },
+  SECRET: { code: "SECRET", label: "API token detected", severity: "HIGH" },
+  API_KEY: { code: "API_KEY", label: "API token detected", severity: "HIGH" },
+  JWT: { code: "JWT", label: "API token detected", severity: "HIGH" },
+  SSN: { code: "SSN", label: "SSN detected", severity: "HIGH" },
+  FINANCIAL: { code: "FINANCIAL", label: "Payment card detected", severity: "HIGH" },
+  EMAIL: { code: "EMAIL", label: "Personal contact info detected", severity: "MED" },
+  PHONE: { code: "PHONE", label: "Personal contact info detected", severity: "MED" },
+  ADDRESS: { code: "ADDRESS", label: "Personal contact info detected", severity: "MED" },
+  PROMPT_INJECTION: { code: "PROMPT_INJECTION", label: "Prompt injection attempt detected", severity: "HIGH" },
+  BURST_VELOCITY: { code: "BURST_VELOCITY", label: "Rapid send behavior detected", severity: "MED" },
+  PASTE_SEND_TOO_FAST: { code: "PASTE_SEND_TOO_FAST", label: "Paste-to-send too fast", severity: "MED" },
+  DOMAIN_DENY: { code: "DOMAIN_DENY", label: "Domain blocked by policy", severity: "HIGH" },
+};
+const domainSendAttempts5s = new Map();
 
 // ─────────────────────────────────────────────
 //  Install / startup
@@ -100,15 +125,16 @@ async function ensureRegisteredContentScript() {
   // Defensive: some environments may not support dynamic registration.
   if (!chrome?.scripting?.getRegisteredContentScripts || !chrome?.scripting?.registerContentScripts) return;
   const id = "pf-main-content-script";
-  const existing = await chrome.scripting.getRegisteredContentScripts({ ids: [id] });
-  if (Array.isArray(existing) && existing.length > 0) return;
+  // Ensure we can update registration across versions.
+  await chrome.scripting.unregisterContentScripts({ ids: [id] }).catch(() => {});
   await chrome.scripting.registerContentScripts([
     {
       id,
       matches: ["https://*/*", "http://*/*"],
       js: ["content_script.js"],
       runAt: "document_idle",
-      allFrames: true,
+      // Avoid iframes (can produce noisy runtime errors / duplicate handlers).
+      allFrames: false,
       persistAcrossSessions: true,
     },
   ]);
@@ -136,13 +162,28 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const url = String(msg.payload?.url || "");
       const trigger = String(msg.payload?.trigger || "unknown");
       const domain = safeDomain(url);
+      const automation = getAutomationSignals({ domain, trigger, meta: msg.payload?.meta });
+      const emptyInjectionResult = { detected: false, score: 0, signals: [] };
 
       const { effectivePolicy } = await getEffectivePolicy();
       const effective = getEffectiveThresholds(effectivePolicy, domain);
 
       const enforceOnly = Array.isArray(effectivePolicy.enforceOnlyOnDomains) ? effectivePolicy.enforceOnlyOnDomains : [];
       if (enforceOnly.length > 0 && !domainInList(domain, enforceOnly)) {
-        const analysis = passthrough(text);
+        const analysis = { ...passthrough(text), automation };
+        const decision = await finalizeDecisionForResponse({
+          domain,
+          analysis,
+          injectionResult: emptyInjectionResult,
+          automation,
+          decision: {
+            action: "ALLOW",
+            canOverride: true,
+            effectiveThresholds: effective,
+            stepUp: { level: 0, required: false, methods: [], reason: "" },
+          },
+          allowAutomationUpgrade: false,
+        });
         await appendLedger({
           eventType: "scan",
           domain,
@@ -150,23 +191,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           risk: 0,
           categories: [],
           counts: {},
-          action: "ALLOW",
+          action: decision.action,
+          automation,
+          reasonCodes: (decision.reasons || []).map((r) => r.code),
+          stepUpLevel: decision.stepUpLevel || 0,
+          stepUpChallengeType: decision.stepUpChallenge?.type || "",
           note: "Managed baseline: enforceOnlyOnDomains excluded this domain.",
         });
         sendResponse({
           ok: true,
+          domain,
           policy: effectivePolicy,
           analysis,
-          decision: { action: "ALLOW", canOverride: true, effectiveThresholds: effective, stepUp: { level: 0, required: false, methods: [], reason: "" } },
+          decision,
           redactedText: text,
           redactions: [],
-          injectionResult: { detected: false, signals: [] },
+          injectionResult: emptyInjectionResult,
         });
         return;
       }
 
       const denyDomains = Array.isArray(effectivePolicy.denyDomains) ? effectivePolicy.denyDomains : [];
       if (domainInList(domain, denyDomains)) {
+        const analysis = { risk: 100, categories: ["DOMAIN_DENY"], counts: { DOMAIN_DENY: 1 }, originalLength: text.length, automation };
+        const decision = await finalizeDecisionForResponse({
+          domain,
+          analysis,
+          injectionResult: emptyInjectionResult,
+          automation,
+          decision: {
+            action: "BLOCK",
+            canOverride: false,
+            effectiveThresholds: effective,
+            stepUp: { level: 0, required: false, methods: [], reason: "Domain denied." },
+          },
+          allowAutomationUpgrade: false,
+        });
         await appendLedger({
           eventType: "scan",
           domain,
@@ -174,24 +234,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           risk: 100,
           categories: ["DOMAIN_DENY"],
           counts: { DOMAIN_DENY: 1 },
-          action: "BLOCK",
+          action: decision.action,
+          automation,
+          reasonCodes: (decision.reasons || []).map((r) => r.code),
+          stepUpLevel: decision.stepUpLevel || 0,
+          stepUpChallengeType: decision.stepUpChallenge?.type || "",
           note: "Blocked by managed/user denyDomains policy.",
         });
         sendResponse({
           ok: true,
+          domain,
           policy: effectivePolicy,
-          analysis: { risk: 100, categories: ["DOMAIN_DENY"], counts: { DOMAIN_DENY: 1 }, originalLength: text.length },
-          decision: { action: "BLOCK", canOverride: false, effectiveThresholds: effective, stepUp: { level: 0, required: false, methods: [], reason: "Domain denied." } },
+          analysis,
+          decision,
           redactedText: text,
           redactions: [],
-          injectionResult: { detected: false, signals: [] },
+          injectionResult: emptyInjectionResult,
           enterpriseDecision: { applied: true, action: "BLOCK", canOverride: false, reason: "Domain is denied by policy." },
         });
         return;
       }
 
       if (!effectivePolicy.enabled || domainInList(domain, effectivePolicy.allowlistDomains)) {
-        const analysis = passthrough(text);
+        const analysis = { ...passthrough(text), automation };
+        const decision = await finalizeDecisionForResponse({
+          domain,
+          analysis,
+          injectionResult: emptyInjectionResult,
+          automation,
+          decision: {
+            action: "ALLOW",
+            canOverride: true,
+            effectiveThresholds: effective,
+            stepUp: { level: 0, required: false, methods: [], reason: "" },
+          },
+          allowAutomationUpgrade: false,
+        });
         await appendLedger({
           eventType: "scan",
           domain,
@@ -199,25 +277,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           risk: 0,
           categories: [],
           counts: {},
-          action: "ALLOW",
+          action: decision.action,
+          automation,
+          reasonCodes: (decision.reasons || []).map((r) => r.code),
+          stepUpLevel: decision.stepUpLevel || 0,
+          stepUpChallengeType: decision.stepUpChallenge?.type || "",
           note: !effectivePolicy.enabled ? "Protection disabled." : "Allowlisted domain bypass.",
         });
         sendResponse({
           ok: true,
+          domain,
           policy: effectivePolicy,
           analysis,
-          decision: { action: "ALLOW", canOverride: true, effectiveThresholds: effective, stepUp: { level: 0, required: false, methods: [], reason: "" } },
+          decision,
           redactedText: text,
           redactions: [],
-          injectionResult: { detected: false, signals: [] },
+          injectionResult: emptyInjectionResult,
         });
         return;
       }
 
-      const analysis = analyzeText(text);
+      const analysis = { ...analyzeText(text), automation };
       const injectionResult = detectPromptInjection(text);
       const redacted = applyRedactions(text, analysis.findings);
-      let decision = decideAction({ analysis, policy: effectivePolicy, effective, injectionResult });
+      let decision = decideAction({ analysis, policy: effectivePolicy, effective, injectionResult, automation });
       const fingerprints = await hashFindingFingerprints(analysis.findings, 12);
 
       let enterpriseDecision = null;
@@ -240,6 +323,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         }
       }
 
+      decision = await finalizeDecisionForResponse({
+        domain,
+        analysis,
+        injectionResult,
+        automation,
+        decision,
+        allowAutomationUpgrade: true,
+      });
+
       await appendLedger({
         eventType: "scan",
         domain,
@@ -250,6 +342,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         redactionCounts: redacted.redactionCounts,
         action: decision.action,
         canOverride: decision.canOverride,
+        automation,
+        reasonCodes: (decision.reasons || []).map((r) => r.code),
+        stepUpLevel: decision.stepUpLevel || 0,
+        stepUpChallengeType: decision.stepUpChallenge?.type || "",
         findingFingerprints: fingerprints,
         injectionDetected: injectionResult.detected,
         injectionSignals: injectionResult.signals,
@@ -260,12 +356,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
       sendResponse({
         ok: true,
+        domain,
         policy: effectivePolicy,
         analysis: {
           risk: analysis.risk,
           categories: analysis.categories,
           counts: analysis.counts,
           originalLength: analysis.originalLength,
+          automation,
         },
         decision,
         redactedText: redacted.redactedText,
@@ -358,6 +456,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         risk: Number.isFinite(payload.risk) ? Number(payload.risk) : 0,
         categories: Array.isArray(payload.categories) ? payload.categories.map(String) : [],
         counts: payload.counts && typeof payload.counts === "object" ? payload.counts : {},
+        automation: payload.automation && typeof payload.automation === "object" ? payload.automation : undefined,
+        reasonCodes: Array.isArray(payload.reasonCodes) ? payload.reasonCodes.map(String) : [],
+        stepUpLevel: Number.isFinite(payload.stepUpLevel) ? Number(payload.stepUpLevel) : undefined,
+        stepUpChallengeType: payload.stepUpChallengeType ? String(payload.stepUpChallengeType) : undefined,
+        stepUpSuccess: typeof payload.stepUpSuccess === "boolean" ? payload.stepUpSuccess : undefined,
+        stepUpAttempted: typeof payload.stepUpAttempted === "boolean" ? payload.stepUpAttempted : undefined,
         note: typeof payload.note === "string" ? payload.note : "",
       });
       sendResponse({ ok: true });
@@ -465,6 +569,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           canOverride: typeof result?.canOverride === "boolean" ? result.canOverride : null,
           reason: result?.reason || "",
           model: enterprise.gemini?.model || "",
+          modelUsed: result?.modelUsed || "",
+          providerUsed: result?.providerUsed || "",
           redactedText: redacted.redactedText,
           analysis: {
             risk: analysis.risk,
@@ -735,13 +841,13 @@ function clampNumber(value, min, max, fallback) {
 
 async function evaluateEnterprisePolicy({ enterprise, domain, trigger, analysis, injectionResult, redactedText }) {
   try {
-    const geminiKey = String(enterprise.gemini?.apiKey || "").trim();
+    const apiKey = String(enterprise.gemini?.apiKey || "").trim();
     const model = String(enterprise.gemini?.model || DEFAULT_ENTERPRISE.gemini.model).trim();
     const policy = (enterprise.policies || []).find((p) => p.id === enterprise.activePolicyId) || enterprise.policies?.[0];
     const policyText = String(policy?.text || "").trim();
     if (!enterprise.enabled) return { applied: false };
-    if (!geminiKey || !model || !policyText) {
-      return { applied: false, reason: "Enterprise policy enabled but Gemini config/policy is missing.", policyName: policy?.name || "" };
+    if (!apiKey || !policyText) {
+      return { applied: false, reason: "Enterprise policy enabled but API key/policy is missing.", policyName: policy?.name || "" };
     }
 
     const prompt = buildEnterprisePrompt({
@@ -753,15 +859,28 @@ async function evaluateEnterprisePolicy({ enterprise, domain, trigger, analysis,
       redactedText,
     });
 
-    const out = await geminiPolicyDecision({
-      apiKey: geminiKey,
-      model,
-      temperature: enterprise.gemini?.temperature ?? DEFAULT_ENTERPRISE.gemini.temperature,
-      prompt,
-    });
+    const provider = inferEnterprisePolicyProvider({ apiKey, model });
+    const out =
+      provider === "openai"
+        ? await openaiPolicyDecision({
+            apiKey,
+            model,
+            temperature: enterprise.gemini?.temperature ?? DEFAULT_ENTERPRISE.gemini.temperature,
+            prompt,
+          })
+        : await geminiPolicyDecision({
+            apiKey,
+            model,
+            temperature: enterprise.gemini?.temperature ?? DEFAULT_ENTERPRISE.gemini.temperature,
+            prompt,
+          });
 
     if (!out?.action) {
-      return { applied: false, reason: "Gemini did not return a decision.", policyName: policy?.name || "" };
+      return {
+        applied: false,
+        reason: `${provider === "openai" ? "OpenAI" : "Gemini"} did not return a decision.`,
+        policyName: policy?.name || "",
+      };
     }
 
     return {
@@ -770,6 +889,8 @@ async function evaluateEnterprisePolicy({ enterprise, domain, trigger, analysis,
       canOverride: out.canOverride,
       reason: String(out.reason || ""),
       policyName: policy?.name || "",
+      modelUsed: String(out.modelUsed || model),
+      providerUsed: provider,
     };
   } catch (err) {
     return {
@@ -821,35 +942,44 @@ function buildEnterprisePrompt({ policyText, domain, trigger, analysis, injectio
 }
 
 async function geminiPolicyDecision({ apiKey, model, temperature, prompt }) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const body = {
     contents: [{ role: "user", parts: [{ text: String(prompt || "") }] }],
     generationConfig: {
       temperature: clampNumber(temperature, 0, 2, 0.2),
       maxOutputTokens: 256,
+      responseMimeType: "application/json",
     },
   };
+  const configuredModel = normalizeGeminiModelName(model);
+  let selectedModel = configuredModel && configuredModel !== "auto" ? configuredModel : "";
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-
-  if (!resp.ok) {
-    throw new Error(`Gemini HTTP ${resp.status}`);
+  if (!selectedModel) {
+    selectedModel = await resolveGeminiGenerateContentModel(apiKey, "");
   }
 
-  const json = await resp.json();
+  let result = await callGeminiGenerateContent({ apiKey, model: selectedModel, body });
+  if (!result.ok && result.status === 404) {
+    const fallbackModel = await resolveGeminiGenerateContentModel(apiKey, selectedModel);
+    if (fallbackModel && fallbackModel !== selectedModel) {
+      result = await callGeminiGenerateContent({ apiKey, model: fallbackModel, body });
+      selectedModel = fallbackModel;
+    }
+  }
+
+  if (!result.ok) {
+    throw new Error(`Gemini HTTP ${result.status}${result.detail ? `: ${result.detail}` : ""}`);
+  }
+
+  const json = result.json;
   const text = extractGeminiText(json);
   const parsed = parseJsonFromText(text);
   if (!parsed || typeof parsed !== "object") return null;
 
-  const action = String(parsed.action || "").toUpperCase();
+  const action = normalizeGeminiAction(parsed.action);
   if (!["ALLOW", "AUTO_REDACT", "BLOCK"].includes(action)) return null;
   const canOverride = typeof parsed.canOverride === "boolean" ? parsed.canOverride : true;
   const reason = typeof parsed.reason === "string" ? parsed.reason : "";
-  return { action, canOverride, reason };
+  return { action, canOverride, reason, modelUsed: selectedModel };
 }
 
 function extractGeminiText(respJson) {
@@ -870,6 +1000,206 @@ function parseJsonFromText(text) {
   } catch {
     return null;
   }
+}
+
+function normalizeGeminiModelName(model) {
+  return String(model || "")
+    .trim()
+    .replace(/^models\//i, "")
+    .replace(/^v\d+(?:beta)?\/models\//i, "");
+}
+
+function normalizeGeminiAction(value) {
+  const raw = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[\s-]+/g, "_");
+  if (raw === "REDACT") return "AUTO_REDACT";
+  if (raw === "AUTOREDACT") return "AUTO_REDACT";
+  if (raw === "BLOCKED") return "BLOCK";
+  if (raw === "ALLOWED") return "ALLOW";
+  return raw;
+}
+
+async function extractGeminiErrorDetail(resp) {
+  try {
+    const clone = resp.clone();
+    const json = await clone.json();
+    const msg = json?.error?.message;
+    if (typeof msg === "string" && msg.trim()) return msg.trim();
+  } catch {
+    // no-op
+  }
+  try {
+    const text = await resp.text();
+    return String(text || "").trim().slice(0, 200);
+  } catch {
+    return "";
+  }
+}
+
+function inferEnterprisePolicyProvider({ apiKey, model }) {
+  const k = String(apiKey || "").trim();
+  const m = String(model || "").trim().toLowerCase();
+  if (/^sk-[a-z0-9]/i.test(k)) return "openai";
+  if (/^(gpt-|o[134]\b|o[134]-|o4-mini)/i.test(m)) return "openai";
+  return "gemini";
+}
+
+async function openaiPolicyDecision({ apiKey, model, temperature, prompt }) {
+  const selectedModel = normalizeOpenAIModelName(model) || "gpt-4o-mini";
+  const baseBody = {
+    model: selectedModel,
+    messages: [
+      {
+        role: "user",
+        content: String(prompt || ""),
+      },
+    ],
+    temperature: clampNumber(temperature, 0, 2, 0.2),
+    max_tokens: 256,
+  };
+
+  let result = await callOpenAIChatCompletions({
+    apiKey,
+    body: { ...baseBody, response_format: { type: "json_object" } },
+  });
+
+  // Some models/endpoints reject response_format; retry without it.
+  if (!result.ok && result.status === 400) {
+    result = await callOpenAIChatCompletions({ apiKey, body: baseBody });
+  }
+
+  if (!result.ok) {
+    throw new Error(`OpenAI HTTP ${result.status}${result.detail ? `: ${result.detail}` : ""}`);
+  }
+
+  const text = extractOpenAIText(result.json);
+  const parsed = parseJsonFromText(text);
+  if (!parsed || typeof parsed !== "object") return null;
+
+  const action = normalizeGeminiAction(parsed.action);
+  if (!["ALLOW", "AUTO_REDACT", "BLOCK"].includes(action)) return null;
+  const canOverride = typeof parsed.canOverride === "boolean" ? parsed.canOverride : true;
+  const reason = typeof parsed.reason === "string" ? parsed.reason : "";
+  return { action, canOverride, reason, modelUsed: selectedModel };
+}
+
+function normalizeOpenAIModelName(model) {
+  const m = String(model || "").trim();
+  if (!m || m.toLowerCase() === "auto") return "gpt-4o-mini";
+  return m;
+}
+
+async function callOpenAIChatCompletions({ apiKey, body }) {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${String(apiKey || "").trim()}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    return { ok: false, status: resp.status, detail: await extractOpenAIErrorDetail(resp) };
+  }
+  return { ok: true, status: resp.status, json: await resp.json() };
+}
+
+function extractOpenAIText(respJson) {
+  const content = respJson?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .map((p) => (p && typeof p.text === "string" ? p.text : ""))
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+async function extractOpenAIErrorDetail(resp) {
+  try {
+    const clone = resp.clone();
+    const json = await clone.json();
+    const msg = json?.error?.message;
+    if (typeof msg === "string" && msg.trim()) return msg.trim();
+  } catch {
+    // no-op
+  }
+  try {
+    const text = await resp.text();
+    return String(text || "").trim().slice(0, 200);
+  } catch {
+    return "";
+  }
+}
+
+async function callGeminiGenerateContent({ apiKey, model, body }) {
+  const normalizedModel = normalizeGeminiModelName(model);
+  if (!normalizedModel || normalizedModel === "auto") {
+    return { ok: false, status: 400, detail: "No Gemini model selected." };
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+    normalizedModel
+  )}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    return { ok: false, status: resp.status, detail: await extractGeminiErrorDetail(resp) };
+  }
+
+  return { ok: true, status: resp.status, json: await resp.json(), model: normalizedModel };
+}
+
+let _geminiModelListCache = { ts: 0, models: [] };
+
+async function resolveGeminiGenerateContentModel(apiKey, excludeModel) {
+  const exclude = normalizeGeminiModelName(excludeModel);
+  const models = await listGeminiGenerateContentModels(apiKey);
+  const candidates = models.filter((m) => normalizeGeminiModelName(m) !== exclude);
+  if (candidates.length === 0) return "";
+  return candidates[0];
+}
+
+async function listGeminiGenerateContentModels(apiKey) {
+  const now = Date.now();
+  if (Array.isArray(_geminiModelListCache.models) && now - _geminiModelListCache.ts < 5 * 60 * 1000) {
+    return _geminiModelListCache.models;
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const detail = await extractGeminiErrorDetail(resp);
+    throw new Error(`Gemini HTTP ${resp.status}${detail ? `: ${detail}` : ""}`);
+  }
+
+  const json = await resp.json();
+  const all = Array.isArray(json?.models) ? json.models : [];
+  const supported = all
+    .filter((m) => Array.isArray(m?.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent"))
+    .map((m) => normalizeGeminiModelName(m?.name))
+    .filter((name) => typeof name === "string" && name.startsWith("gemini-"));
+
+  const ranked = Array.from(new Set(supported)).sort((a, b) => geminiModelRank(a) - geminiModelRank(b) || a.localeCompare(b));
+  _geminiModelListCache = { ts: now, models: ranked };
+  return ranked;
+}
+
+function geminiModelRank(name) {
+  const n = String(name || "").toLowerCase();
+  if (n.includes("flash-lite")) return 0;
+  if (n.includes("flash")) return 1;
+  if (n.includes("pro")) return 2;
+  return 9;
 }
 
 function normalizePolicy(input) {
@@ -963,6 +1293,245 @@ function passthrough(text) {
   return { risk: 0, categories: [], counts: {}, findings: [], originalLength: text.length };
 }
 
+function getAutomationSignals({ domain, trigger, meta }) {
+  const now = Date.now();
+  const cleanDomain = String(domain || "unknown").toLowerCase();
+  const kind = String(trigger || "unknown");
+  let attemptsIn5s = 0;
+
+  if (kind !== "paste") {
+    const current = Array.isArray(domainSendAttempts5s.get(cleanDomain)) ? domainSendAttempts5s.get(cleanDomain) : [];
+    const next = current.filter((ts) => Number.isFinite(ts) && now - ts <= AUTOMATION_WINDOW_MS);
+    next.push(now);
+    domainSendAttempts5s.set(cleanDomain, next);
+    attemptsIn5s = next.length;
+  } else {
+    const current = Array.isArray(domainSendAttempts5s.get(cleanDomain)) ? domainSendAttempts5s.get(cleanDomain) : [];
+    const pruned = current.filter((ts) => Number.isFinite(ts) && now - ts <= AUTOMATION_WINDOW_MS);
+    if (pruned.length !== current.length) domainSendAttempts5s.set(cleanDomain, pruned);
+    attemptsIn5s = pruned.length;
+  }
+
+  const rawTimeSincePaste = Number(meta && typeof meta === "object" ? meta.timeSincePasteMs : NaN);
+  const timeSincePasteMs = Number.isFinite(rawTimeSincePaste)
+    ? clampInt(rawTimeSincePaste, 0, 600000, Math.round(rawTimeSincePaste))
+    : null;
+  const pasteSendTooFast = kind !== "paste" && timeSincePasteMs !== null && timeSincePasteMs < PASTE_SEND_TOO_FAST_MS;
+  const burst = kind !== "paste" && attemptsIn5s >= AUTOMATION_BURST_THRESHOLD;
+
+  return { burst, pasteSendTooFast, attemptsIn5s, timeSincePasteMs };
+}
+
+function pickRotatingChallengeType(pool, lastType, rand = Math.random) {
+  const basePool = Array.isArray(pool) ? pool.filter(Boolean).map(String) : [];
+  const uniquePool = Array.from(new Set(basePool));
+  if (uniquePool.length === 0) return "HOLD";
+  const filtered = uniquePool.filter((t) => t !== String(lastType || ""));
+  const options = filtered.length > 0 ? filtered : uniquePool;
+  const idx = Math.max(0, Math.min(options.length - 1, Math.floor(Math.abs(rand()) * options.length)));
+  return options[idx];
+}
+
+async function selectRotatingL2Challenge(domain, primaryCategory) {
+  const key = `${String(domain || "unknown")}|${String(primaryCategory || "UNKNOWN")}`;
+  const { [STEPUP_LAST_CHALLENGE_KEY]: raw } = await chrome.storage.local.get(STEPUP_LAST_CHALLENGE_KEY);
+  const store = raw && typeof raw === "object" ? { ...raw } : {};
+  const last = store[key];
+  const type = pickRotatingChallengeType(L2_CHALLENGE_POOL, last);
+  store[key] = type;
+  await chrome.storage.local.set({ [STEPUP_LAST_CHALLENGE_KEY]: store });
+  return { type, payload: buildStepUpChallengePayload(type) };
+}
+
+function buildStepUpChallengePayload(type) {
+  const challengeType = String(type || "HOLD").toUpperCase();
+  if (challengeType === "OTP") {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const code = String(buf[0] % 1000000).padStart(6, "0");
+    return { code, ttlMs: 60000, issuedAtMs: Date.now() };
+  }
+  if (challengeType === "SLIDER") {
+    return { target: 100, mustHoldMs: 250 };
+  }
+  if (challengeType === "RETYPE") {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    let x = buf[0] >>> 0;
+    let phrase = "";
+    for (let i = 0; i < 4; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      phrase += alphabet[(x >>> 0) % alphabet.length];
+    }
+    return { phrase, ttlMs: 60000, issuedAtMs: Date.now() };
+  }
+  return { durationMs: 1800 };
+}
+
+function normalizeStepUp(stepUp) {
+  if (!stepUp || typeof stepUp !== "object") return { level: 0, required: false, methods: [], reason: "" };
+  const level = Number.isFinite(stepUp.level) ? Number(stepUp.level) : 0;
+  return {
+    level: level === 2 ? 2 : level === 1 ? 1 : 0,
+    required: Boolean(stepUp.required),
+    methods: Array.isArray(stepUp.methods) ? stepUp.methods.map(String) : [],
+    reason: typeof stepUp.reason === "string" ? stepUp.reason : "",
+  };
+}
+
+function normalizeDecisionAction(action) {
+  const raw = String(action || "ALLOW").toUpperCase();
+  return ["ALLOW", "AUTO_REDACT", "BLOCK", "STEP_UP"].includes(raw) ? raw : "ALLOW";
+}
+
+function buildAutomationReasonCodes(automation) {
+  const codes = [];
+  if (automation?.burst) codes.push("BURST_VELOCITY");
+  if (automation?.pasteSendTooFast) codes.push("PASTE_SEND_TOO_FAST");
+  return codes;
+}
+
+function getPrimaryCategory(categories, preferredList) {
+  const cats = Array.isArray(categories) ? categories.map(String) : [];
+  if (Array.isArray(preferredList)) {
+    for (const pref of preferredList) {
+      if (cats.includes(pref)) return pref;
+    }
+  }
+  return cats[0] || "UNKNOWN";
+}
+
+function buildReasonObject(code) {
+  const normalized = String(code || "UNKNOWN").toUpperCase();
+  if (REASON_MAP[normalized]) return { ...REASON_MAP[normalized] };
+  return {
+    code: normalized,
+    label: `${normalized.replace(/_/g, " ").toLowerCase()} detected`,
+    severity: "LOW",
+  };
+}
+
+function buildDecisionReasonObjects({ analysis, injectionResult, automation, decision, extraCodes = [] }) {
+  const codes = [];
+  const categories = Array.isArray(analysis?.categories) ? analysis.categories : [];
+  for (const cat of categories) codes.push(String(cat));
+  if (injectionResult?.detected) codes.push("PROMPT_INJECTION");
+  if (decision?.action === "STEP_UP" || decision?.stepUp?.required) {
+    codes.push(...buildAutomationReasonCodes(automation));
+  }
+  if (Array.isArray(extraCodes)) codes.push(...extraCodes);
+
+  const uniqCodes = Array.from(new Set(codes.map((c) => String(c || "").toUpperCase()).filter(Boolean)));
+  const byLabel = new Map();
+  for (const code of uniqCodes) {
+    const reason = buildReasonObject(code);
+    const key = `${reason.label}|${reason.severity}`;
+    if (!byLabel.has(key)) byLabel.set(key, reason);
+  }
+
+  return Array.from(byLabel.values())
+    .sort((a, b) => {
+      const sa = REASON_SEVERITY_RANK[a.severity] || 0;
+      const sb = REASON_SEVERITY_RANK[b.severity] || 0;
+      if (sb !== sa) return sb - sa;
+      return String(a.label).localeCompare(String(b.label));
+    })
+    .slice(0, 3);
+}
+
+function buildHumanExplanation(action, reasons) {
+  const list = Array.isArray(reasons) ? reasons : [];
+  if (action === "ALLOW" || list.length === 0) return "";
+  const prefix = action === "AUTO_REDACT" ? "Auto-redacted because:" : "Blocked because:";
+  let text = `${prefix} ${list[0].label}.`;
+  if (list[1]) text += ` Also: ${list[1].label}.`;
+  return text;
+}
+
+async function finalizeDecisionForResponse({
+  domain,
+  analysis,
+  injectionResult,
+  automation,
+  decision,
+  allowAutomationUpgrade = true,
+}) {
+  const categories = Array.isArray(analysis?.categories) ? analysis.categories.map(String) : [];
+  const injectionBlocked = Boolean(injectionResult?.detected && Number(injectionResult?.score) >= 30);
+  const sensitiveCategories = L2_SENSITIVE_CATEGORIES.filter((c) => categories.includes(c));
+
+  let action = normalizeDecisionAction(decision?.action);
+  let stepUp = normalizeStepUp(decision?.stepUp);
+
+  if (injectionBlocked) {
+    stepUp = { level: 0, required: false, methods: [], reason: "Prompt injection block." };
+  } else if (sensitiveCategories.length > 0) {
+    stepUp = {
+      level: 2,
+      required: true,
+      methods: [...L2_CHALLENGE_POOL],
+      reason: "Sensitive data detected (step-up L2).",
+    };
+    if (action !== "BLOCK") action = "STEP_UP";
+  } else if (action === "BLOCK") {
+    stepUp = {
+      level: 1,
+      required: true,
+      methods: ["HOLD"],
+      reason: "High-risk send detected (step-up L1).",
+    };
+  } else {
+    stepUp = { level: 0, required: false, methods: [], reason: "" };
+  }
+
+  const automationCodes = buildAutomationReasonCodes(automation);
+  if (
+    allowAutomationUpgrade &&
+    action === "ALLOW" &&
+    automationCodes.length > 0
+  ) {
+    action = "STEP_UP";
+    stepUp = {
+      level: 1,
+      required: true,
+      methods: ["HOLD"],
+      reason: "Automation-like behavior detected (step-up L1).",
+    };
+  }
+
+  let stepUpChallenge = null;
+  let stepUpReasonCodes = [];
+  if (stepUp.required && stepUp.level === 1) {
+    stepUpChallenge = { type: "HOLD", payload: { durationMs: L1_STEPUP_HOLD_MS } };
+    stepUpReasonCodes = automationCodes.length > 0 ? automationCodes : (categories.length > 0 ? [getPrimaryCategory(categories)] : []);
+  } else if (stepUp.required && stepUp.level === 2) {
+    const primaryCategory = getPrimaryCategory(categories, L2_SENSITIVE_CATEGORIES);
+    stepUpChallenge = await selectRotatingL2Challenge(domain, primaryCategory);
+    stepUpReasonCodes = [primaryCategory];
+  }
+
+  const reasons = action === "ALLOW"
+    ? []
+    : buildDecisionReasonObjects({ analysis, injectionResult, automation, decision: { action, stepUp }, extraCodes: stepUpReasonCodes });
+  const humanExplanation = buildHumanExplanation(action, reasons);
+
+  return {
+    ...(decision && typeof decision === "object" ? decision : {}),
+    action,
+    canOverride: typeof decision?.canOverride === "boolean" ? decision.canOverride : true,
+    effectiveThresholds: decision?.effectiveThresholds,
+    stepUp: stepUp.required ? { ...stepUp, challenge: stepUpChallenge } : stepUp,
+    stepUpLevel: stepUp.required ? stepUp.level : 0,
+    stepUpReasonCodes,
+    humanExplanation,
+    reasons,
+    stepUpChallenge,
+  };
+}
+
 function decideAction({ analysis, policy, effective, injectionResult }) {
   const categories = analysis.categories || [];
   const hasHardSecret = categories.includes("PRIVATE_KEY") || categories.includes("SECRET") || categories.includes("JWT");
@@ -971,22 +1540,21 @@ function decideAction({ analysis, policy, effective, injectionResult }) {
   if (analysis.risk >= effective.block) action = "BLOCK";
   else if (analysis.risk >= effective.autoRedact) action = "AUTO_REDACT";
 
-  if (hasHardSecret && analysis.risk >= effective.autoRedact) {
-    action = action === "ALLOW" ? "AUTO_REDACT" : action;
-  }
-
-  if (injectionResult && injectionResult.detected && injectionResult.score >= 30) {
+  // For demo + real security: hard secrets always trigger a Step-Up (modal),
+  // rather than silently auto-redacting and sending.
+  if (hasHardSecret) {
     action = "BLOCK";
   }
 
-  const canOverride = !(hasHardSecret && policy.denyOverridesForSecrets);
+  const injectionBlocked = Boolean(injectionResult && injectionResult.detected && injectionResult.score >= 30);
+  if (injectionBlocked) action = "BLOCK";
 
-  // Adaptive Step-Up: escalate verification only when risk is high.
-  // L0: allow/autoredact normally
-  // L1: low-friction verification (hold/type) for high-risk blocks
-  // L2: OTP-style verification for secret-class blocks (API keys, private keys, JWTs)
+  // Step-up replaces "deny override" for secrets: allow original send only after verification.
+  const canOverride = !injectionBlocked;
+
+  // Legacy step-up hint; finalized later (after enterprise overrides / automation signals).
   const stepUp = (() => {
-    if (injectionResult && injectionResult.detected && injectionResult.score >= 30) {
+    if (injectionBlocked) {
       return { level: 0, required: false, methods: [], reason: "Prompt injection block." };
     }
     if (action !== "BLOCK") return { level: 0, required: false, methods: [], reason: "" };
@@ -1002,13 +1570,59 @@ function decideAction({ analysis, policy, effective, injectionResult }) {
     return {
       level: 1,
       required: true,
-      methods: ["HOLD", "TYPE_ALLOW"],
+      methods: ["HOLD"],
       reason: "High-risk send detected (step-up L1).",
     };
   })();
 
   return { action, canOverride, effectiveThresholds: effective, stepUp };
 }
+
+// Dev-only self-tests (invoke manually from extension service worker console):
+//   await globalThis.__PF_RUN_DEV_TESTS__()
+// Manual demo scenarios:
+// - ALLOW: "Explain photosynthesis"
+// - AUTO_REDACT: "Email me at student@example.com, phone (202) 555-0147"
+// - L2: include dummy private key block => challenge appears
+// - Repeat L2 again => challenge type rotates (OTP -> SLIDER -> HOLD)
+// - Burst: send same harmless prompt 4+ times quickly => L1 HOLD triggers
+async function runPromptFirewallDevTests() {
+  const nextType = pickRotatingChallengeType(["OTP", "SLIDER", "HOLD"], "OTP", () => 0);
+  console.assert(nextType !== "OTP", "Rotation test failed: next challenge repeated OTP");
+
+  const burstDecision = await finalizeDecisionForResponse({
+    domain: "chat.openai.com",
+    analysis: { risk: 0, categories: [], counts: {}, automation: { burst: true, pasteSendTooFast: false, attemptsIn5s: 4, timeSincePasteMs: null } },
+    injectionResult: { detected: false, score: 0, signals: [] },
+    automation: { burst: true, pasteSendTooFast: false, attemptsIn5s: 4, timeSincePasteMs: null },
+    decision: { action: "ALLOW", canOverride: true, effectiveThresholds: { block: 70, autoRedact: 30, strict: false }, stepUp: { level: 0, required: false, methods: [], reason: "" } },
+    allowAutomationUpgrade: true,
+  });
+  console.assert(
+    burstDecision.action === "STEP_UP" && burstDecision.stepUpLevel === 1,
+    "Automation burst test failed: expected STEP_UP L1"
+  );
+
+  const explainDecision = await finalizeDecisionForResponse({
+    domain: "chat.openai.com",
+    analysis: { risk: 100, categories: ["PRIVATE_KEY"], counts: { PRIVATE_KEY: 1 }, automation: { burst: false, pasteSendTooFast: false, attemptsIn5s: 1, timeSincePasteMs: null } },
+    injectionResult: { detected: false, score: 0, signals: [] },
+    automation: { burst: false, pasteSendTooFast: false, attemptsIn5s: 1, timeSincePasteMs: null },
+    decision: { action: "BLOCK", canOverride: true, effectiveThresholds: { block: 70, autoRedact: 30, strict: false }, stepUp: { level: 2, required: true, methods: ["OTP"], reason: "" } },
+    allowAutomationUpgrade: true,
+  });
+  console.assert(
+    /Private key detected/i.test(String(explainDecision.humanExplanation || "")),
+    "Explanation test failed: missing private-key explanation"
+  );
+  console.assert(
+    Array.isArray(explainDecision.reasons) && explainDecision.reasons.some((r) => r.code === "PRIVATE_KEY"),
+    "Explanation test failed: reasons missing PRIVATE_KEY"
+  );
+  return true;
+}
+
+globalThis.__PF_RUN_DEV_TESTS__ = runPromptFirewallDevTests;
 
 // ─────────────────────────────────────────────
 //  Ledger
@@ -1029,10 +1643,27 @@ async function appendLedger(entry) {
     counts: entry.counts && typeof entry.counts === "object" ? entry.counts : {},
     redactionCounts: entry.redactionCounts && typeof entry.redactionCounts === "object" ? entry.redactionCounts : {},
     canOverride: typeof entry.canOverride === "boolean" ? entry.canOverride : undefined,
+    automation:
+      entry.automation && typeof entry.automation === "object"
+        ? {
+            burst: Boolean(entry.automation.burst),
+            pasteSendTooFast: Boolean(entry.automation.pasteSendTooFast),
+            attemptsIn5s: Number.isFinite(entry.automation.attemptsIn5s) ? Number(entry.automation.attemptsIn5s) : undefined,
+            timeSincePasteMs: Number.isFinite(entry.automation.timeSincePasteMs) ? Number(entry.automation.timeSincePasteMs) : null,
+          }
+        : undefined,
+    reasonCodes: Array.isArray(entry.reasonCodes) ? entry.reasonCodes.map(String) : [],
+    stepUpLevel: Number.isFinite(entry.stepUpLevel) ? Number(entry.stepUpLevel) : undefined,
+    stepUpChallengeType: entry.stepUpChallengeType ? String(entry.stepUpChallengeType) : undefined,
+    stepUpSuccess: typeof entry.stepUpSuccess === "boolean" ? entry.stepUpSuccess : undefined,
+    stepUpAttempted: typeof entry.stepUpAttempted === "boolean" ? entry.stepUpAttempted : undefined,
     note: typeof entry.note === "string" ? entry.note : "",
     findingFingerprints: Array.isArray(entry.findingFingerprints) ? entry.findingFingerprints : [],
     injectionDetected: Boolean(entry.injectionDetected),
     injectionSignals: Array.isArray(entry.injectionSignals) ? entry.injectionSignals : [],
+    enterpriseApplied: typeof entry.enterpriseApplied === "boolean" ? entry.enterpriseApplied : undefined,
+    enterprisePolicyName: entry.enterprisePolicyName ? String(entry.enterprisePolicyName) : undefined,
+    enterpriseReason: entry.enterpriseReason ? String(entry.enterpriseReason) : undefined,
   };
 
   const prevHash = current.length > 0 ? String(current[0].entryHash || "") : "GENESIS";
@@ -1101,8 +1732,8 @@ function clampInt(value, min, max, fallback) {
 // ─────────────────────────────────────────────
 const DETECTORS = [
   { category: "EMAIL", regex: /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi },
+  { category: "SSN", regex: /\b\d{3}(?:[- ]?)\d{2}(?:[- ]?)\d{4}\b/g },
   { category: "PHONE", regex: /\b(?:\+?\d{1,2}[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g },
-  { category: "SSN", regex: /\b\d{3}-\d{2}-\d{4}\b/g },
   { category: "SECRET", regex: /\bAKIA[0-9A-Z]{16}\b/g },
   { category: "SECRET", regex: /\bAIza[0-9A-Za-z\-_]{35}\b/g },
   { category: "SECRET", regex: /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b/g },
@@ -1340,4 +1971,3 @@ function buildSafeRewrite(redactedText, categories) {
     redactedText,
   ].join("\n");
 }
-

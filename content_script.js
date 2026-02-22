@@ -13,9 +13,21 @@ const PF_STATE = {
   // Session-only safe substitution mapping
   substitutionCache: new Map(),
   substitutionSerial: {},
+  runtimeInvalidated: false,
+  runtimeInvalidatedNotified: false,
 };
 
-const EDITABLE_SELECTOR = 'textarea, [contenteditable="true"], [contenteditable="plaintext-only"]';
+// Only run in the top frame (ChatGPT and similar apps can have sandboxed iframes).
+const PF_TOP_FRAME = (() => {
+  try {
+    return window.top === window;
+  } catch {
+    return true;
+  }
+})();
+
+const EDITABLE_SELECTOR =
+  'textarea, [contenteditable]:not([contenteditable="false"])';
 const CHAT_HOST_HINTS = ["chatgpt.com", "chat.openai.com", "gemini.google.com", "claude.ai", "perplexity.ai"];
 const CHAT_INPUT_HINTS = ["prompt", "message", "chat", "ask", "assistant"];
 
@@ -28,6 +40,10 @@ try {
   // no-op
 }
 
+if (!PF_TOP_FRAME) {
+  // Skip event handlers in iframes.
+  // Still allow the marker above for quick debugging if it runs.
+} else {
 document.addEventListener(
   "focusin",
   (e) => {
@@ -41,9 +57,13 @@ document.addEventListener(
   "keydown",
   (e) => {
     if (!shouldHandle(e)) return;
-    if (e.key !== "Enter" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
+    // Allow plain Enter and Ctrl/Cmd+Enter (many chat apps support both).
+    if (e.key !== "Enter" || e.shiftKey || e.altKey) return;
     if (e.isComposing) return;
-    const el = getEditableFromTarget(e.target);
+    let el = getEditableFromTarget(e.target);
+    if (!el && isKnownChatHost() && PF_STATE.lastFocusedEditable && document.contains(PF_STATE.lastFocusedEditable)) {
+      el = PF_STATE.lastFocusedEditable;
+    }
     if (!el || !isLikelyChatInput(el)) return;
     const text = getText(el);
     if (!text.trim()) return;
@@ -58,7 +78,7 @@ document.addEventListener(
   "click",
   (e) => {
     if (!shouldHandle(e)) return;
-    const btn = getSendButton(e.target);
+    const btn = getSendButton(e.target) || getHostHeuristicSendButton(e.target);
     if (!btn) return;
     const el = locateBestEditable(btn);
     if (!el || !isLikelyChatInput(el)) return;
@@ -100,9 +120,15 @@ document.addEventListener(
   },
   true
 );
+}
 
 function shouldHandle(e) {
-  return e.isTrusted && !PF_STATE.inFlight && Date.now() >= PF_STATE.bypassUntil;
+  return e.isTrusted && !PF_STATE.runtimeInvalidated && !PF_STATE.inFlight && Date.now() >= PF_STATE.bypassUntil;
+}
+
+function isKnownChatHost() {
+  const host = location.hostname.toLowerCase();
+  return CHAT_HOST_HINTS.some((h) => host === h || host.endsWith(`.${h}`));
 }
 
 // ─────────────────────────────────────────────
@@ -127,13 +153,23 @@ async function handleSend({ editable, originalText, triggerMeta }) {
 
     const resp = await sendMsg({
       type: "CLASSIFY_AND_REDACT",
-      payload: { text: originalText, url: location.href, trigger: triggerMeta.type },
+      payload: {
+        text: originalText,
+        url: location.href,
+        trigger: triggerMeta.type,
+        meta: { timeSincePasteMs: getTimeSinceLastPasteMs() },
+      },
     });
 
     if (!resp?.ok) {
-      toast("Prompt Firewall: scan failed, sending original.");
-      await executeSend(editable, originalText, triggerMeta);
-    return;
+      const errMsg = String(resp?.error || "");
+      if (/extension context invalidated/i.test(errMsg)) {
+        markRuntimeInvalidated(errMsg);
+        toast("Prompt Firewall updated. Refresh this tab to send.", 4500);
+        return;
+      }
+      toast("Prompt Firewall scan failed. Send blocked.", 3200);
+      return;
     }
 
     const { analysis, decision, redactedText, redactions, policy, injectionResult } = resp;
@@ -174,9 +210,178 @@ async function handleSend({ editable, originalText, triggerMeta }) {
       return;
     }
 
+    const cats = Array.isArray(analysis?.categories) ? analysis.categories : [];
+    const hasHardSecret = cats.includes("PRIVATE_KEY") || cats.includes("SECRET") || cats.includes("JWT");
+    const decisionReasonCodes = Array.isArray(decision?.stepUpReasonCodes) && decision.stepUpReasonCodes.length > 0
+      ? decision.stepUpReasonCodes
+      : Array.isArray(decision?.reasons)
+        ? decision.reasons.map((r) => r.code).filter(Boolean)
+        : [];
+    const decisionStepUpLevel = Number(decision?.stepUpLevel || decision?.stepUp?.level || 0) || 0;
+    const decisionStepUpChallengeType =
+      decision?.stepUpChallenge?.type || decision?.stepUp?.challenge?.type || "";
+
+    if (decision.action === "STEP_UP") {
+      const choice = await showBlockModal({
+        mode: "STEP_UP",
+        analysis,
+        originalText,
+        redactedText,
+        redactions,
+        canOverride: false,
+        holdMs: policy?.holdToConfirmMs || 2000,
+        stepUp: decision.stepUp || { level: decisionStepUpLevel || 1, required: true, methods: ["HOLD"], reason: "Verification required." },
+        stepUpChallenge: decision.stepUpChallenge || decision?.stepUp?.challenge || null,
+        stepUpReasonCodes: decisionReasonCodes,
+        humanExplanation: decision?.humanExplanation || "",
+        reasons: Array.isArray(decision?.reasons) ? decision.reasons : [],
+        injectionResult,
+        proxyHops,
+        proxyFinalText: proxyHops ? textToSend : "",
+      });
+
+      if (choice === "STEP_UP_VERIFIED") {
+        const isL2 = decisionStepUpLevel === 2;
+        const finalText = isL2
+          ? (proxyHops ? textToSend : (redactedText || originalText))
+          : (proxyHops ? textToSend : originalText);
+        await executeSend(editable, finalText, triggerMeta);
+        if (isL2) await storeVaultEntries(redactions);
+        await appendResolution({
+          action: isL2 ? "STEP_UP_SEND_REDACTED" : "STEP_UP_SEND_ORIGINAL",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          reasonCodes: decisionReasonCodes,
+          stepUpLevel: decisionStepUpLevel || undefined,
+          stepUpChallengeType: decisionStepUpChallengeType || undefined,
+          automation: analysis?.automation || undefined,
+          note: isL2 ? "L2 step-up passed; sent redacted text." : "L1 step-up passed; sent original text.",
+        });
+        if (proxyHops) showProxyToast(proxyHops);
+        return;
+      }
+
+      toast("Send canceled.");
+      await appendResolution({
+        action: "STEP_UP_CANCELLED",
+        risk: analysis.risk,
+        categories: analysis.categories,
+        counts: analysis.counts,
+        reasonCodes: decisionReasonCodes,
+        stepUpLevel: decisionStepUpLevel || undefined,
+        stepUpChallengeType: decisionStepUpChallengeType || undefined,
+        automation: analysis?.automation || undefined,
+        note: "User canceled required step-up verification.",
+      });
+      return;
+    }
+
+    // For hard secrets, always show a confirmation popup (demo-friendly).
+    // This preserves productivity (send redacted/safe-sub) while still enabling step-up for sending original.
+    if (decision.action === "AUTO_REDACT" && hasHardSecret) {
+      const choice = await showBlockModal({
+        mode: "BLOCK",
+        analysis,
+        originalText,
+        redactedText,
+        redactions,
+        canOverride: Boolean(decision.canOverride),
+        holdMs: policy?.holdToConfirmMs || 2000,
+        stepUp: decision.stepUp || { level: 2, required: true, methods: ["OTP"], reason: "Hard secret detected." },
+        stepUpChallenge: decision.stepUpChallenge || decision?.stepUp?.challenge || null,
+        stepUpReasonCodes: decisionReasonCodes,
+        humanExplanation: decision?.humanExplanation || "",
+        reasons: Array.isArray(decision?.reasons) ? decision.reasons : [],
+        injectionResult,
+        proxyHops,
+        proxyFinalText: proxyHops ? textToSend : "",
+      });
+
+      if (choice === "SEND_REDACTED") {
+        const finalText = proxyHops ? textToSend : redactedText;
+        await executeSend(editable, finalText, triggerMeta);
+        await storeVaultEntries(redactions);
+        await appendResolution({
+          action: "SEND_REDACTED",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          note: "Secret flow: user chose redacted send.",
+        });
+        if (proxyHops) showProxyToast(proxyHops);
+        return;
+      }
+
+      if (choice === "SEND_SAFE_SUBSTITUTED") {
+        const substituted = buildSafeSubstitutedText(originalText, redactions || []);
+        const finalText = proxyHops ? textToSend : substituted;
+        await executeSend(editable, finalText, triggerMeta);
+        await storeVaultEntries(redactions);
+        await appendResolution({
+          action: "SEND_SAFE_SUBSTITUTED",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          note: "Secret flow: user chose safe substitution send.",
+        });
+        if (proxyHops) showProxyToast(proxyHops);
+        return;
+      }
+
+      if (choice === "SEND_REWRITE") {
+        const rewrite = await sendMsg({ type: "SAFE_REWRITE", payload: { redactedText, categories: analysis.categories || [] } });
+        const output = rewrite?.ok && rewrite.rewrittenText ? rewrite.rewrittenText : redactedText;
+        const finalText = proxyHops ? textToSend : output;
+        await executeSend(editable, finalText, triggerMeta);
+        await storeVaultEntries(redactions);
+        await appendResolution({
+          action: "SEND_REWRITE",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          note: "Secret flow: user chose redacted + safe rewrite.",
+        });
+        return;
+      }
+
+      if (choice === "OVERRIDE_ORIGINAL") {
+        if (!decision.canOverride) {
+          toast("Override denied by policy for secret-class data.");
+          await appendResolution({
+            action: "OVERRIDE_DENIED",
+            risk: analysis.risk,
+            categories: analysis.categories,
+            counts: analysis.counts,
+            note: "Secret flow: policy denied secret override.",
+          });
+          return;
+        }
+        await executeSend(editable, originalText, triggerMeta);
+        await appendResolution({
+          action: "OVERRIDE_ORIGINAL",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          note: "Secret flow: user completed step-up and sent original.",
+        });
+        return;
+      }
+
+      toast("Send canceled.");
+      await appendResolution({
+        action: "CANCELLED",
+        risk: analysis.risk,
+        categories: analysis.categories,
+        counts: analysis.counts,
+        note: "Secret flow: user canceled.",
+      });
+      return;
+    }
+
     if (decision.action === "AUTO_REDACT") {
       const finalText = proxyHops ? textToSend : redactedText;
-      toast(`Sensitive data redacted (risk ${analysis.risk}/100).`);
+      toast(decision?.humanExplanation || `Sensitive data redacted (risk ${analysis.risk}/100).`);
       await executeSend(editable, finalText, triggerMeta);
       await storeVaultEntries(redactions);
       await appendResolution({
@@ -184,6 +389,8 @@ async function handleSend({ editable, originalText, triggerMeta }) {
         risk: analysis.risk,
         categories: analysis.categories,
         counts: analysis.counts,
+        reasonCodes: Array.isArray(decision?.reasons) ? decision.reasons.map((r) => r.code).filter(Boolean) : [],
+        automation: analysis?.automation || undefined,
         note: "Auto-redacted and sent.",
       });
       if (proxyHops) showProxyToast(proxyHops);
@@ -192,14 +399,21 @@ async function handleSend({ editable, originalText, triggerMeta }) {
 
     // BLOCK ── show modal
     const choice = await showBlockModal({
+      mode: "BLOCK",
       analysis,
+      originalText,
       redactedText,
       redactions,
       canOverride: decision.canOverride,
       holdMs: policy?.holdToConfirmMs || 2000,
       stepUp: decision.stepUp || null,
+      stepUpChallenge: decision.stepUpChallenge || decision?.stepUp?.challenge || null,
+      stepUpReasonCodes: decisionReasonCodes,
+      humanExplanation: decision?.humanExplanation || "",
+      reasons: Array.isArray(decision?.reasons) ? decision.reasons : [],
       injectionResult,
       proxyHops,
+      proxyFinalText: proxyHops ? textToSend : "",
     });
 
     if (choice === "SEND_REDACTED") {
@@ -280,24 +494,66 @@ async function handleSend({ editable, originalText, triggerMeta }) {
       counts: analysis.counts,
       note: "User canceled blocked send.",
     });
-  } catch {
-    toast("Prompt Firewall: fallback send.");
-    await executeSend(editable, originalText, triggerMeta);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : "Unhandled error.";
+    if (/extension context invalidated/i.test(errMsg)) {
+      markRuntimeInvalidated(errMsg);
+      toast("Prompt Firewall updated. Refresh this tab to send.", 4500);
+      return;
+    }
+    toast("Prompt Firewall error. Send blocked.", 3200);
   } finally {
     PF_STATE.inFlight = false;
   }
 }
 
 async function handlePaste(event, editable, pastedText) {
+  // Must cancel the browser paste synchronously; doing it after await causes
+  // the original text to paste first and the sanitized text to be appended.
+  event.preventDefault();
+
   PF_STATE.lastPasteAt = Date.now();
   PF_STATE.pasteBurst = pruneWindow([...PF_STATE.pasteBurst, PF_STATE.lastPasteAt], 1200);
 
   const resp = await sendMsg({
     type: "CLASSIFY_AND_REDACT",
-    payload: { text: pastedText, url: location.href, trigger: "paste" },
+    payload: { text: pastedText, url: location.href, trigger: "paste", meta: { timeSincePasteMs: null } },
   });
-  if (!resp?.ok || !resp.policy?.clipboardProtection || resp.decision.action === "ALLOW") return;
-  event.preventDefault();
+
+  if (!resp?.ok) {
+    const errMsg = String(resp?.error || "");
+    if (/extension context invalidated/i.test(errMsg)) {
+      markRuntimeInvalidated(errMsg);
+      toast("Prompt Firewall updated. Refresh this tab to paste.", 4500);
+      return;
+    }
+    insertAtCursor(editable, pastedText);
+    return;
+  }
+
+  if (!resp.policy?.clipboardProtection || resp.decision?.action === "ALLOW") {
+    insertAtCursor(editable, pastedText);
+    return;
+  }
+
+  const cats = Array.isArray(resp.analysis?.categories) ? resp.analysis.categories : [];
+  const hasHardSecret = cats.includes("PRIVATE_KEY") || cats.includes("SECRET") || cats.includes("JWT");
+
+  // For hard secrets, do NOT sanitize the paste. We want the send flow to show
+  // the Step-Up modal (OTP) and allow safe substitution from the original.
+  if (hasHardSecret) {
+    insertAtCursor(editable, pastedText);
+    toast("Hard secret detected — Step-Up required on send.", 3500);
+    await appendResolution({
+      action: "PASTE_HARD_SECRET",
+      risk: resp.analysis?.risk || 0,
+      categories: cats,
+      counts: resp.analysis?.counts || {},
+      note: "Clipboard protection allowed hard-secret paste; step-up enforced on send.",
+    });
+    return;
+  }
+
   insertAtCursor(editable, resp.redactedText || pastedText);
   toast(`Paste sanitized (${resp.analysis?.risk || 0}/100).`);
   await storeVaultEntries(resp.redactions || []);
@@ -360,20 +616,132 @@ function showProxyToast(hops) {
   toast(`Proxy chain: ${ok} hop(s) OK${fail ? `, ${fail} failed (passthrough)` : ""}.`);
 }
 
+function getTimeSinceLastPasteMs() {
+  if (!Number.isFinite(PF_STATE.lastPasteAt) || PF_STATE.lastPasteAt <= 0) return null;
+  const delta = Date.now() - PF_STATE.lastPasteAt;
+  if (!Number.isFinite(delta) || delta < 0) return null;
+  return delta > 600000 ? null : delta;
+}
+
+function normalizeReasonChips(reasons) {
+  if (!Array.isArray(reasons)) return [];
+  return reasons
+    .filter((r) => r && typeof r === "object")
+    .map((r) => ({
+      code: String(r.code || "UNKNOWN"),
+      label: String(r.label || r.code || "Unknown reason"),
+      severity: ["LOW", "MED", "HIGH"].includes(String(r.severity || "").toUpperCase())
+        ? String(r.severity || "").toUpperCase()
+        : "LOW",
+    }))
+    .slice(0, 3);
+}
+
+function renderReasonChipsHtml(reasons) {
+  const chips = normalizeReasonChips(reasons);
+  if (chips.length === 0) return "";
+  return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">${chips
+    .map((r) => {
+      const palette =
+        r.severity === "HIGH"
+          ? { bg: "#fee2e2", border: "#fca5a5", text: "#991b1b" }
+          : r.severity === "MED"
+            ? { bg: "#fef3c7", border: "#fcd34d", text: "#92400e" }
+            : { bg: "#e0f2fe", border: "#7dd3fc", text: "#0c4a6e" };
+      return `<span title="${escHtml(r.label)}" style="display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;border:1px solid ${palette.border};background:${palette.bg};color:${palette.text};font-size:11px;font-weight:700;">
+        <span>${escHtml(r.code)}</span>
+        <span style="font-weight:600;opacity:0.9;">${escHtml(r.label)}</span>
+      </span>`;
+    })
+    .join("")}</div>`;
+}
+
+function resolveStepUpChallenge(stepUp, stepUpChallenge) {
+  const explicit = stepUpChallenge && typeof stepUpChallenge === "object" ? stepUpChallenge : stepUp?.challenge;
+  const type = String(explicit?.type || (stepUp?.level === 2 ? "OTP" : "HOLD")).toUpperCase();
+  const payload = explicit && typeof explicit.payload === "object" ? explicit.payload : {};
+  if (type === "OTP") {
+    return {
+      type,
+      payload: {
+        code: String(payload.code || ""),
+        ttlMs: Number.isFinite(payload.ttlMs) ? Number(payload.ttlMs) : 60000,
+        issuedAtMs: Number.isFinite(payload.issuedAtMs) ? Number(payload.issuedAtMs) : Date.now(),
+      },
+    };
+  }
+  if (type === "SLIDER") {
+    return {
+      type,
+      payload: {
+        target: Number.isFinite(payload.target) ? Number(payload.target) : 100,
+        mustHoldMs: Number.isFinite(payload.mustHoldMs) ? Number(payload.mustHoldMs) : 250,
+      },
+    };
+  }
+  if (type === "RETYPE") {
+    return {
+      type,
+      payload: {
+        phrase: String(payload.phrase || ""),
+        ttlMs: Number.isFinite(payload.ttlMs) ? Number(payload.ttlMs) : 60000,
+        issuedAtMs: Number.isFinite(payload.issuedAtMs) ? Number(payload.issuedAtMs) : Date.now(),
+      },
+    };
+  }
+  return {
+    type: "HOLD",
+    payload: {
+      durationMs: Number.isFinite(payload.durationMs) ? Number(payload.durationMs) : (stepUp?.level === 2 ? 1800 : 1200),
+    },
+  };
+}
+
 // ─────────────────────────────────────────────
 //  Block modal (extended)
 // ─────────────────────────────────────────────
-function showBlockModal({ analysis, redactedText, redactions, canOverride, holdMs, stepUp, injectionResult, proxyHops }) {
+function showBlockModal({
+  mode = "BLOCK",
+  analysis,
+  originalText,
+  redactedText,
+  redactions,
+  canOverride,
+  holdMs,
+  stepUp,
+  stepUpChallenge,
+  stepUpReasonCodes,
+  humanExplanation,
+  reasons,
+  injectionResult,
+  proxyHops,
+  proxyFinalText,
+}) {
   return new Promise((resolve) => {
     let timer = null;
     let start = 0;
     let verifyTimer = null;
     let verifyStart = 0;
+    let sliderHoldTimer = null;
     let verified = false;
+    let stepUpOutcomeLogged = false;
 
+    const viewMode = String(mode || "BLOCK").toUpperCase() === "STEP_UP" ? "STEP_UP" : "BLOCK";
     const step = stepUp && typeof stepUp === "object" && stepUp.required ? stepUp : null;
+    const challenge = step ? resolveStepUpChallenge(step, stepUpChallenge) : null;
     const hasRedactions = Array.isArray(redactions) && redactions.length > 0;
-    const otpCode = step?.level === 2 ? generateOtpCode() : "";
+    const reasonChips = normalizeReasonChips(reasons);
+    const reasonChipsHtml = renderReasonChipsHtml(reasonChips);
+    const explanationLine =
+      typeof humanExplanation === "string" && humanExplanation.trim()
+        ? humanExplanation.trim()
+        : step?.reason
+          ? `Blocked because: ${step.reason}`
+          : "";
+    const requireVerifyBeforeSafeSend = Boolean(step && (viewMode === "STEP_UP" || Number(step.level || 0) >= 2));
+    const stepUpLevel = step ? Number(step.level || 0) : 0;
+    const stepUpType = challenge?.type || "";
+    const stepUpCodes = Array.isArray(stepUpReasonCodes) ? stepUpReasonCodes.map(String) : [];
 
     const overlay = mk("div", [
       "position:fixed",
@@ -398,7 +766,8 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
       "font:13px/1.45 system-ui,sans-serif",
     ]);
 
-    const categoryText = (analysis.categories || []).join(", ") || "Unknown";
+    const categories = Array.isArray(analysis?.categories) ? analysis.categories : [];
+    const categoryText = categories.join(", ") || "Unknown";
     const redactionSummary = summarizeRedactions(redactions || []);
     const injectionHtml = injectionResult?.detected
       ? `<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:10px;padding:8px 10px;margin-bottom:10px;">
@@ -429,47 +798,143 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
 
     const verifyHtml = step
       ? (() => {
-          if (step.level === 2) {
+          const levelBadge = step.level === 2 ? "L2" : "L1";
+          if (challenge?.type === "OTP") {
             return `<div id="pf-verify-zone" style="margin-bottom:10px;border:1px solid #93c5fd;background:#eff6ff;border-radius:12px;padding:10px;">
-              <div style="font-weight:700;font-size:12px;color:#1e3a8a;margin-bottom:6px;">Step-Up L2 verification</div>
-              <div style="font-size:12px;color:#1e40af;margin-bottom:8px;">Enter the one-time code to unlock sending:</div>
+              <div style="font-weight:700;font-size:12px;color:#1e3a8a;margin-bottom:6px;">Step-Up ${levelBadge} verification</div>
+              <div style="font-size:12px;color:#1e40af;margin-bottom:8px;">Enter the one-time code to continue:</div>
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
                 <span style="font-family:ui-monospace,monospace;font-weight:800;letter-spacing:0.08em;background:#dbeafe;color:#1e3a8a;padding:6px 10px;border-radius:10px;">${escHtml(
-                  otpCode
+                  String(challenge.payload?.code || "")
                 )}</span>
                 <input id="pf-otp-input" inputmode="numeric" autocomplete="one-time-code" placeholder="Enter code" style="padding:8px 10px;border:1px solid #93c5fd;border-radius:10px;min-width:180px;"/>
                 <span id="pf-verify-status" style="font-size:12px;color:#1e3a8a;"></span>
               </div>
             </div>`;
           }
-          // L1
+          if (challenge?.type === "SLIDER") {
+            return `<div id="pf-verify-zone" style="margin-bottom:10px;border:1px solid #bfdbfe;background:#eff6ff;border-radius:12px;padding:10px;">
+              <div style="font-weight:700;font-size:12px;color:#1d4ed8;margin-bottom:6px;">Step-Up ${levelBadge} verification</div>
+              <div style="font-size:12px;color:#1e40af;margin-bottom:8px;">Slide to <b>${escHtml(
+                String(challenge.payload?.target ?? 100)
+              )}</b>, hold briefly, then verify.</div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <input id="pf-slider-input" type="range" min="0" max="100" value="0" style="flex:1;min-width:220px;"/>
+                <span id="pf-slider-value" style="font:12px ui-monospace,monospace;color:#1e40af;min-width:32px;text-align:right;">0</span>
+                <button id="pf-slider-verify" disabled style="padding:8px 10px;border:0;border-radius:10px;background:#1d4ed8;color:#fff;font-weight:700;cursor:pointer;opacity:0.55;">Verify</button>
+              </div>
+              <div id="pf-verify-status" style="font-size:12px;color:#1e40af;margin-top:8px;"></div>
+            </div>`;
+          }
+          if (challenge?.type === "RETYPE") {
+            return `<div id="pf-verify-zone" style="margin-bottom:10px;border:1px solid #d8b4fe;background:#faf5ff;border-radius:12px;padding:10px;">
+              <div style="font-weight:700;font-size:12px;color:#7e22ce;margin-bottom:6px;">Step-Up ${levelBadge} verification</div>
+              <div style="font-size:12px;color:#6b21a8;margin-bottom:8px;">Retype this phrase to continue:</div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                <span style="font-family:ui-monospace,monospace;font-weight:800;letter-spacing:0.08em;background:#f3e8ff;color:#6b21a8;padding:6px 10px;border-radius:10px;">${escHtml(
+                  String(challenge.payload?.phrase || "")
+                )}</span>
+                <input id="pf-retype-input" placeholder="Retype phrase" style="padding:8px 10px;border:1px solid #d8b4fe;border-radius:10px;min-width:180px;"/>
+                <span id="pf-verify-status" style="font-size:12px;color:#6b21a8;"></span>
+              </div>
+            </div>`;
+          }
           return `<div id="pf-verify-zone" style="margin-bottom:10px;border:1px solid #fcd34d;background:#fffbeb;border-radius:12px;padding:10px;">
-            <div style="font-weight:700;font-size:12px;color:#92400e;margin-bottom:6px;">Step-Up L1 verification</div>
-            <div style="font-size:12px;color:#78350f;margin-bottom:8px;">Hold for 1.5s or type <b>ALLOW</b> to unlock sending.</div>
+            <div style="font-weight:700;font-size:12px;color:#92400e;margin-bottom:6px;">Step-Up ${levelBadge} verification</div>
+            <div style="font-size:12px;color:#78350f;margin-bottom:8px;">Hold to confirm for <b>${Math.round(
+              Number(challenge?.payload?.durationMs || 1200) / 100
+            ) / 10}s</b>.</div>
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
               <div style="flex:1;min-width:220px;">
                 <div style="height:8px;border-radius:999px;background:#fde68a;overflow:hidden;margin-bottom:8px;">
                   <div id="pf-verify-hold-progress" style="width:0%;height:100%;background:#f59e0b;transition:width 0.05s linear;"></div>
                 </div>
-                <button id="pf-verify-hold-btn" style="padding:8px 10px;border:0;border-radius:10px;background:#92400e;color:#fff;font-weight:700;cursor:pointer;">Hold to unlock</button>
+                <button id="pf-verify-hold-btn" style="padding:8px 10px;border:0;border-radius:10px;background:#92400e;color:#fff;font-weight:700;cursor:pointer;">Hold to verify</button>
               </div>
-              <div style="display:flex;gap:8px;align-items:center;">
-                <input id="pf-verify-input" placeholder="Type ALLOW" style="padding:8px 10px;border:1px solid #fcd34d;border-radius:10px;min-width:180px;"/>
-                <span id="pf-verify-status" style="font-size:12px;color:#92400e;"></span>
-              </div>
+              <span id="pf-verify-status" style="font-size:12px;color:#92400e;"></span>
             </div>
           </div>`;
         })()
       : "";
 
+    const substitutedPreview =
+      Array.isArray(redactions) && redactions.length > 0 ? buildSafeSubstitutedText(originalText || "", redactions) : "";
+    const proxyPreview = typeof proxyFinalText === "string" && proxyFinalText ? proxyFinalText : "";
+    const proxyCharCount = proxyPreview ? countVisibleChars(proxyPreview) : 0;
+    const redactedCharCount = redactedText ? countVisibleChars(String(redactedText)) : 0;
+    const substitutedCharCount = substitutedPreview ? countVisibleChars(String(substitutedPreview)) : 0;
+    const previewTextFull = [
+      `Risk: ${Number.isFinite(analysis?.risk) ? analysis.risk : 0}/100`,
+      `Detected: ${categoryText}`,
+      `Redacted prompt length: ${redactedCharCount} chars`,
+      substitutedPreview ? `Safe substituted length: ${substitutedCharCount} chars` : "Safe substituted length: (none)",
+      proxyPreview
+        ? `After proxy chain length: ${proxyCharCount} chars (proxy runs on redacted text)`
+        : "After proxy chain length: (none)",
+      "",
+      "Redacted prompt:",
+      String(redactedText || ""),
+      "",
+      substitutedPreview ? "Safe substituted preview:" : "Safe substituted preview: (none)",
+      substitutedPreview ? substitutedPreview : "",
+      proxyPreview ? "\nAfter proxy chain (what will be sent if proxy enabled):" : "",
+      proxyPreview ? proxyPreview : "",
+    ]
+      .filter((l) => l !== "")
+      .join("\n");
+
+    const previewTextLocked = [
+      "Preview locked.",
+      viewMode === "STEP_UP"
+        ? "Complete verification above to continue sending."
+        : "Complete Step‑Up verification above to view the full preview.",
+      "",
+      "Tip: you can still send redacted or safe‑substituted without revealing the full preview here.",
+    ].join("\n");
+
+    const previewTextInitial = step ? previewTextLocked : previewTextFull;
+
+    const titleText = viewMode === "STEP_UP" ? "Prompt Firewall verification required" : "Prompt Firewall blocked this send";
+    const explanationHtml = explanationLine
+      ? `<div style="font-size:13px;font-weight:700;color:#0f172a;margin-bottom:6px;">${escHtml(explanationLine)}</div>`
+      : "";
+    const stepUpAutoSendHint =
+      viewMode === "STEP_UP"
+        ? `<div style="font-size:12px;color:#475569;margin-bottom:10px;">Complete verification to continue. L2 sends use redacted text by default.</div>`
+        : "";
+    const footerButtonsHtml =
+      viewMode === "STEP_UP"
+        ? `<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;align-items:center;">
+             <span style="font-size:12px;color:#475569;margin-right:auto;">${step ? "Verification required before send." : ""}</span>
+             <button id="pf-cancel" style="padding:8px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:10px;cursor:pointer;">Cancel</button>
+           </div>`
+        : `<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;">
+             <button id="pf-cancel" style="padding:8px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:10px;cursor:pointer;">Cancel</button>
+             <button id="pf-send-redacted" style="padding:8px 10px;border:0;background:#111827;color:#fff;border-radius:10px;cursor:pointer;">Send redacted</button>
+             ${
+               hasRedactions
+                 ? `<button id="pf-send-safe-sub" style="padding:8px 10px;border:0;background:#065f46;color:#fff;border-radius:10px;cursor:pointer;">Send safe substituted</button>`
+                 : ""
+             }
+             <button id="pf-send-rewrite" style="padding:8px 10px;border:0;background:#1d4ed8;color:#fff;border-radius:10px;cursor:pointer;">Send + safe rewrite</button>
+             ${
+               canOverride
+                 ? `<button id="pf-request-override" ${step ? "disabled" : ""} style="padding:8px 10px;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:10px;cursor:pointer;${step ? "opacity:0.55;cursor:not-allowed;" : ""}">Send original (step-up)</button>`
+                 : '<button disabled style="padding:8px 10px;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8;border-radius:10px;">Override disabled</button>'
+             }
+           </div>`;
+
     card.innerHTML = `
       <div style="display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px;">
-        <div style="font-weight:700;font-size:15px;">Prompt Firewall blocked this send</div>
+        <div style="font-weight:700;font-size:15px;">${escHtml(titleText)}</div>
         <div style="font-size:12px;background:#111827;color:#fff;padding:4px 8px;border-radius:999px;">Risk ${escHtml(
           String(analysis.risk || 0)
         )}/100</div>
       </div>
+      ${explanationHtml}
+      ${reasonChipsHtml}
       <div style="font-size:12px;color:#4b5563;margin-bottom:10px;">Detected: <b>${escHtml(categoryText)}</b></div>
+      ${stepUpAutoSendHint}
       ${injectionHtml}
       ${proxyHtml}
       ${verifyHtml}
@@ -479,9 +944,12 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
           <div style="font-size:12px;color:#334155">${escHtml(redactionSummary || "No redactions.")}</div>
         </div>
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:10px;">
-          <div style="font-size:12px;font-weight:600;margin-bottom:6px;">Redacted preview</div>
-          <pre style="margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.35 ui-monospace,monospace;color:#0f172a;max-height:200px;overflow:auto;">${escHtml(
-            redactedText || ""
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;">
+            <div style="font-size:12px;font-weight:700;">Redacted preview</div>
+            <button id="pf-toggle-preview" ${step ? "disabled" : ""} style="border:1px solid #cbd5e1;background:#fff;border-radius:999px;padding:4px 10px;cursor:pointer;font-weight:700;font-size:11px;color:#0f172a;${step ? "opacity:0.6;cursor:not-allowed;" : ""}">${step ? "Locked" : "Expand"}</button>
+          </div>
+          <pre id="pf-preview" style="margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.35 ui-monospace,monospace;color:#0f172a;min-height:160px;max-height:420px;overflow:auto;">${escHtml(
+            previewTextInitial
           )}</pre>
         </div>
       </div>
@@ -495,25 +963,26 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
         </div>
         <button id="pf-hold-btn" style="padding:8px 10px;border:0;border-radius:10px;background:#92400e;color:#fff;font-weight:600;cursor:pointer;">Hold to confirm override</button>
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end;">
-        <button id="pf-cancel" style="padding:8px 10px;border:1px solid #cbd5e1;background:#fff;border-radius:10px;cursor:pointer;">Cancel</button>
-        <button id="pf-send-redacted" ${step ? "disabled" : ""} style="padding:8px 10px;border:0;background:#111827;color:#fff;border-radius:10px;cursor:pointer;${step ? "opacity:0.55;cursor:not-allowed;" : ""}">Send redacted</button>
-        ${
-          hasRedactions
-            ? `<button id="pf-send-safe-sub" ${step ? "disabled" : ""} style="padding:8px 10px;border:0;background:#065f46;color:#fff;border-radius:10px;cursor:pointer;${step ? "opacity:0.55;cursor:not-allowed;" : ""}">Send safe substituted</button>`
-            : ""
-        }
-        <button id="pf-send-rewrite" ${step ? "disabled" : ""} style="padding:8px 10px;border:0;background:#1d4ed8;color:#fff;border-radius:10px;cursor:pointer;${step ? "opacity:0.55;cursor:not-allowed;" : ""}">Send + safe rewrite</button>
-        ${
-          canOverride
-            ? `<button id="pf-request-override" ${step ? "disabled" : ""} style="padding:8px 10px;border:1px solid #f59e0b;background:#fffbeb;color:#92400e;border-radius:10px;cursor:pointer;${step ? "opacity:0.55;cursor:not-allowed;" : ""}">Send original (step-up)</button>`
-            : '<button disabled style="padding:8px 10px;border:1px solid #e2e8f0;background:#f8fafc;color:#94a3b8;border-radius:10px;">Override disabled</button>'
-        }
-      </div>
+      ${footerButtonsHtml}
     `;
 
     overlay.appendChild(card);
     document.body.appendChild(overlay);
+
+    if (step) {
+      void appendResolution({
+        action: "STEP_UP_ATTEMPT",
+        risk: analysis?.risk || 0,
+        categories: Array.isArray(analysis?.categories) ? analysis.categories : [],
+        counts: analysis?.counts || {},
+        reasonCodes: stepUpCodes,
+        stepUpLevel: stepUpLevel || undefined,
+        stepUpChallengeType: stepUpType || undefined,
+        stepUpAttempted: true,
+        automation: analysis?.automation || undefined,
+        note: `Step-up challenge shown (${viewMode.toLowerCase()}).`,
+      });
+    }
 
     const cleanup = () => {
       if (timer) {
@@ -524,10 +993,30 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
         clearInterval(verifyTimer);
         verifyTimer = null;
       }
+      if (sliderHoldTimer) {
+        clearTimeout(sliderHoldTimer);
+        sliderHoldTimer = null;
+      }
       window.removeEventListener("keydown", onEsc, true);
       overlay.remove();
     };
     const done = (choice) => {
+      if (step && !verified && !stepUpOutcomeLogged) {
+        const skipped = ["SEND_REDACTED", "SEND_SAFE_SUBSTITUTED", "SEND_REWRITE"].includes(String(choice || ""));
+        stepUpOutcomeLogged = true;
+        void appendResolution({
+          action: skipped ? "STEP_UP_SKIPPED" : "STEP_UP_ABORTED",
+          risk: analysis?.risk || 0,
+          categories: Array.isArray(analysis?.categories) ? analysis.categories : [],
+          counts: analysis?.counts || {},
+          reasonCodes: stepUpCodes,
+          stepUpLevel: stepUpLevel || undefined,
+          stepUpChallengeType: stepUpType || undefined,
+          stepUpSuccess: false,
+          automation: analysis?.automation || undefined,
+          note: skipped ? "User chose safe path without completing step-up." : "Step-up challenge not completed.",
+        });
+      }
       cleanup();
       resolve(choice);
     };
@@ -543,54 +1032,210 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
       if (e.target === overlay) done("CANCEL");
     });
     card.querySelector("#pf-cancel")?.addEventListener("click", () => done("CANCEL"));
-    card.querySelector("#pf-send-redacted")?.addEventListener("click", () => (step && !verified ? null : done("SEND_REDACTED")));
-    card.querySelector("#pf-send-safe-sub")?.addEventListener("click", () => (step && !verified ? null : done("SEND_SAFE_SUBSTITUTED")));
-    card.querySelector("#pf-send-rewrite")?.addEventListener("click", () => (step && !verified ? null : done("SEND_REWRITE")));
+    card.querySelector("#pf-send-redacted")?.addEventListener("click", () => done("SEND_REDACTED"));
+    card.querySelector("#pf-send-safe-sub")?.addEventListener("click", () => done("SEND_SAFE_SUBSTITUTED"));
+    card.querySelector("#pf-send-rewrite")?.addEventListener("click", () => done("SEND_REWRITE"));
+
+    // Redacted preview expand/collapse.
+    const preview = card.querySelector("#pf-preview");
+    const togglePreview = card.querySelector("#pf-toggle-preview");
+    if (preview && togglePreview) {
+      let expanded = false;
+      togglePreview.addEventListener("click", () => {
+        if (step && !verified) return;
+        expanded = !expanded;
+        preview.style.maxHeight = expanded ? "72vh" : "420px";
+        preview.style.minHeight = expanded ? "260px" : "120px";
+        togglePreview.textContent = expanded ? "Collapse" : "Expand";
+      });
+    }
 
     const overrideBtn = card.querySelector("#pf-request-override");
     const zone = card.querySelector("#pf-override-zone");
     const holdBtn = card.querySelector("#pf-hold-btn");
     const progress = card.querySelector("#pf-hold-progress");
 
-    const sendBtns = [
+    const safeSendBtns = [
       card.querySelector("#pf-send-redacted"),
       card.querySelector("#pf-send-safe-sub"),
       card.querySelector("#pf-send-rewrite"),
+    ].filter(Boolean);
+
+    const sendBtns = [
+      ...safeSendBtns,
       overrideBtn,
     ].filter(Boolean);
 
+    if (requireVerifyBeforeSafeSend) {
+      for (const b of sendBtns) {
+        b.disabled = true;
+        b.style.opacity = "0.55";
+        b.style.cursor = "not-allowed";
+      }
+    }
+
+    const setStatusText = (text) => {
+      const status = card.querySelector("#pf-verify-status");
+      if (status) status.textContent = String(text || "");
+    };
+
     const setVerified = () => {
       verified = true;
-      const status = card.querySelector("#pf-verify-status");
-      if (status) status.textContent = "Unlocked ✓";
+      setStatusText(viewMode === "STEP_UP" ? "Verified ✓" : "Unlocked ✓");
+      // Unlock preview content after verification.
+      if (preview) preview.textContent = previewTextFull;
+      if (togglePreview) {
+        togglePreview.disabled = false;
+        togglePreview.style.opacity = "";
+        togglePreview.style.cursor = "";
+        if (String(togglePreview.textContent || "").trim().toLowerCase() === "locked") togglePreview.textContent = "Expand";
+      }
       for (const b of sendBtns) {
         b.disabled = false;
         b.style.opacity = "";
         b.style.cursor = "";
       }
       const v = card.querySelector("#pf-verify-zone");
+      if (viewMode === "STEP_UP") {
+        if (!stepUpOutcomeLogged) {
+          stepUpOutcomeLogged = true;
+          void appendResolution({
+            action: "STEP_UP_SUCCESS",
+            risk: analysis?.risk || 0,
+            categories: Array.isArray(analysis?.categories) ? analysis.categories : [],
+            counts: analysis?.counts || {},
+            reasonCodes: stepUpCodes,
+            stepUpLevel: stepUpLevel || undefined,
+            stepUpChallengeType: stepUpType || undefined,
+            stepUpSuccess: true,
+            automation: analysis?.automation || undefined,
+            note: "Step-up verification completed.",
+          });
+        }
+        done("STEP_UP_VERIFIED");
+        return;
+      }
       if (v) v.style.display = "none";
+      if (!stepUpOutcomeLogged) {
+        stepUpOutcomeLogged = true;
+        void appendResolution({
+          action: "STEP_UP_SUCCESS",
+          risk: analysis?.risk || 0,
+          categories: Array.isArray(analysis?.categories) ? analysis.categories : [],
+          counts: analysis?.counts || {},
+          reasonCodes: stepUpCodes,
+          stepUpLevel: stepUpLevel || undefined,
+          stepUpChallengeType: stepUpType || undefined,
+          stepUpSuccess: true,
+          automation: analysis?.automation || undefined,
+          note: "Step-up verification completed.",
+        });
+      }
     };
 
     // Step-up verification handlers
     if (step) {
-      if (step.level === 2) {
+      if (challenge?.type === "OTP") {
         const input = card.querySelector("#pf-otp-input");
-        const status = card.querySelector("#pf-verify-status");
         if (input) {
           input.addEventListener("input", () => {
             const v = String(input.value || "").replace(/\s+/g, "");
-            if (v.length >= 6) {
-              if (v === otpCode) setVerified();
-              else if (status) status.textContent = "Incorrect code";
+            const ttlMs = Number(challenge.payload?.ttlMs || 60000);
+            const issuedAtMs = Number(challenge.payload?.issuedAtMs || Date.now());
+            if (Date.now() - issuedAtMs > ttlMs) {
+              setStatusText("Code expired");
+              return;
+            }
+            const expected = String(challenge.payload?.code || "");
+            if (v.length >= Math.max(1, expected.length)) {
+              if (v === expected) setVerified();
+              else setStatusText("Incorrect code");
+            }
+          });
+        }
+      } else if (challenge?.type === "SLIDER") {
+        const slider = card.querySelector("#pf-slider-input");
+        const sliderValue = card.querySelector("#pf-slider-value");
+        const verifyBtn = card.querySelector("#pf-slider-verify");
+        const target = Number(challenge.payload?.target ?? 100);
+        const mustHoldMs = Number(challenge.payload?.mustHoldMs ?? 250);
+        let sliderReady = false;
+
+        const resetSliderReady = (message = "") => {
+          sliderReady = false;
+          if (sliderHoldTimer) {
+            clearTimeout(sliderHoldTimer);
+            sliderHoldTimer = null;
+          }
+          if (verifyBtn) {
+            verifyBtn.disabled = true;
+            verifyBtn.style.opacity = "0.55";
+            verifyBtn.style.cursor = "not-allowed";
+          }
+          if (message) setStatusText(message);
+        };
+
+        const maybeStartSliderHold = (value) => {
+          if (value < target) {
+            resetSliderReady("");
+            return;
+          }
+          if (sliderReady || sliderHoldTimer) return;
+          setStatusText("Hold at target...");
+          sliderHoldTimer = setTimeout(() => {
+            sliderHoldTimer = null;
+            sliderReady = true;
+            if (verifyBtn) {
+              verifyBtn.disabled = false;
+              verifyBtn.style.opacity = "";
+              verifyBtn.style.cursor = "";
+            }
+            setStatusText("Ready to verify");
+          }, mustHoldMs);
+        };
+
+        if (slider) {
+          slider.addEventListener("input", () => {
+            const value = Number(slider.value || 0);
+            if (sliderValue) sliderValue.textContent = String(Math.round(value));
+            if (value >= target) maybeStartSliderHold(value);
+            else resetSliderReady("");
+          });
+          slider.addEventListener("change", () => {
+            const value = Number(slider.value || 0);
+            if (value < target) resetSliderReady("");
+          });
+        }
+        if (verifyBtn) {
+          verifyBtn.addEventListener("click", () => {
+            if (!sliderReady) {
+              setStatusText("Slide to target and hold briefly");
+              return;
+            }
+            setVerified();
+          });
+        }
+      } else if (challenge?.type === "RETYPE") {
+        const input = card.querySelector("#pf-retype-input");
+        if (input) {
+          input.addEventListener("input", () => {
+            const ttlMs = Number(challenge.payload?.ttlMs || 60000);
+            const issuedAtMs = Number(challenge.payload?.issuedAtMs || Date.now());
+            if (Date.now() - issuedAtMs > ttlMs) {
+              setStatusText("Phrase expired");
+              return;
+            }
+            const expected = String(challenge.payload?.phrase || "");
+            const v = String(input.value || "").trim().toUpperCase();
+            if (v.length >= Math.max(1, expected.length)) {
+              if (v === expected.toUpperCase()) setVerified();
+              else setStatusText("Incorrect phrase");
             }
           });
         }
       } else {
-        const vInput = card.querySelector("#pf-verify-input");
         const vHoldBtn = card.querySelector("#pf-verify-hold-btn");
         const vProgress = card.querySelector("#pf-verify-hold-progress");
-        const vStatus = card.querySelector("#pf-verify-status");
 
         const resetVerifyHold = () => {
           if (verifyTimer) {
@@ -604,7 +1249,7 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
           if (!vHoldBtn || !vProgress) return;
           resetVerifyHold();
           verifyStart = Date.now();
-          const unlockMs = 1500;
+          const unlockMs = Number(challenge?.payload?.durationMs || (step.level === 2 ? 1800 : 1200));
           verifyTimer = setInterval(() => {
             const pct = Math.min(1, (Date.now() - verifyStart) / unlockMs);
             vProgress.style.width = `${Math.round(pct * 100)}%`;
@@ -622,14 +1267,6 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
           vHoldBtn.addEventListener("mouseleave", resetVerifyHold);
           vHoldBtn.addEventListener("touchend", resetVerifyHold);
           vHoldBtn.addEventListener("touchcancel", resetVerifyHold);
-        }
-
-        if (vInput) {
-          vInput.addEventListener("input", () => {
-            const v = String(vInput.value || "").trim().toUpperCase();
-            if (v === "ALLOW") setVerified();
-            else if (v.length >= 5 && vStatus) vStatus.textContent = "Type ALLOW";
-          });
         }
       }
     }
@@ -673,6 +1310,21 @@ function showBlockModal({ analysis, redactedText, redactions, canOverride, holdM
   });
 }
 
+function countVisibleChars(text) {
+  const s = String(text || "");
+  try {
+    // Grapheme clusters = closest to "what users see as characters".
+    // Supported in modern Chromium.
+    const seg = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+    let n = 0;
+    for (const _part of seg.segment(s)) n++;
+    return n;
+  } catch {
+    // Fallback: code points (better than UTF-16 .length for emojis).
+    return Array.from(s).length;
+  }
+}
+
 // ─────────────────────────────────────────────
 //  DOM helpers
 // ─────────────────────────────────────────────
@@ -691,7 +1343,8 @@ function getEditableFromTarget(target) {
 function isEditable(el) {
   if (!(el instanceof Element)) return false;
   if (el.matches("textarea")) return !el.hasAttribute("disabled") && !el.hasAttribute("readonly");
-  return el.getAttribute("contenteditable") === "true" || el.getAttribute("contenteditable") === "plaintext-only";
+  if (!el.hasAttribute("contenteditable")) return false;
+  return (el.getAttribute("contenteditable") || "").toLowerCase() !== "false";
 }
 
 function isLikelyChatInput(el) {
@@ -709,7 +1362,7 @@ function isLikelyChatInput(el) {
 
 function getText(el) {
   if (el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement) return el.value || "";
-  return (el.innerText || "").replace(/\u00a0/g, " ");
+  return (el.innerText || el.textContent || "").replace(/\u00a0/g, " ");
 }
 
 function setText(el, text) {
@@ -729,8 +1382,29 @@ function getSendButton(target) {
   return btn;
 }
 
+function getHostHeuristicSendButton(target) {
+  if (!isKnownChatHost()) return null;
+  if (!(target instanceof Element)) return null;
+  const btn = target.closest('button, [role="button"], input[type="submit"]');
+  if (!btn || !isUsableButtonLike(btn) || looksLikeNonSendAction(btn)) return null;
+
+  const editable = locateBestEditable(btn);
+  if (!editable || !isLikelyChatInput(editable)) return null;
+  const text = getText(editable);
+  if (!text.trim()) return null;
+
+  const form = btn.closest("form");
+  if (form && form.contains(editable)) return btn;
+
+  const container = btn.closest("section, main, article, div");
+  if (container && container.contains(editable)) return btn;
+
+  return null;
+}
+
 function looksLikeSend(btn) {
   if (btn.matches('[data-testid="send-button"]')) return true;
+  if (btn.matches('[data-testid*="send" i], [aria-label*="send message" i]')) return true;
   const text = [
     btn.getAttribute("aria-label"),
     btn.getAttribute("title"),
@@ -742,6 +1416,30 @@ function looksLikeSend(btn) {
     .join(" ")
     .toLowerCase();
   return /(send|submit|run|ask|arrow up|paper airplane|upward)/.test(text);
+}
+
+function looksLikeNonSendAction(btn) {
+  const text = [
+    btn.getAttribute("aria-label"),
+    btn.getAttribute("title"),
+    btn.textContent,
+    btn.getAttribute("data-testid"),
+    btn.getAttribute("name"),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return /(attach|upload|image|voice|mic|microphone|menu|history|model|tools?|plus|add file)/.test(text);
+}
+
+function isUsableButtonLike(btn) {
+  if (!(btn instanceof HTMLElement)) return false;
+  if ((btn instanceof HTMLButtonElement || btn instanceof HTMLInputElement) && btn.disabled) return false;
+  if (btn.getAttribute("aria-disabled") === "true") return false;
+  const r = btn.getBoundingClientRect();
+  if (r.width < 6 || r.height < 6) return false;
+  const s = getComputedStyle(btn);
+  return s.visibility !== "hidden" && s.display !== "none" && s.pointerEvents !== "none";
 }
 
 function locateBestEditable(anchor) {
@@ -808,12 +1506,7 @@ function clickKnownSend() {
   for (const sel of selectors) {
     const candidates = Array.from(document.querySelectorAll(sel));
     const target = candidates.find((el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      if ((el instanceof HTMLButtonElement || el instanceof HTMLInputElement) && el.disabled) return false;
-      const r = el.getBoundingClientRect();
-      if (r.width < 6 || r.height < 6) return false;
-      const s = getComputedStyle(el);
-      return s.visibility !== "hidden" && s.display !== "none" && s.pointerEvents !== "none";
+      return isUsableButtonLike(el);
     });
     if (target) {
       target.click();
@@ -828,14 +1521,49 @@ function clickKnownSend() {
 // ─────────────────────────────────────────────
 function sendMsg(msg) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(msg, (resp) => {
-      if (chrome.runtime.lastError) {
-        resolve({ ok: false, error: chrome.runtime.lastError.message });
+    try {
+      if (!chrome?.runtime?.id) {
+        markRuntimeInvalidated("Extension context invalidated.");
+        resolve({ ok: false, error: "Extension context invalidated." });
         return;
       }
-      resolve(resp || { ok: false, error: "No response." });
-    });
+      chrome.runtime.sendMessage(msg, (resp) => {
+        try {
+          const errMsg = chrome.runtime.lastError?.message || "";
+          if (errMsg) {
+            if (/extension context invalidated/i.test(errMsg)) markRuntimeInvalidated(errMsg);
+            resolve({ ok: false, error: errMsg });
+            return;
+          }
+          resolve(resp || { ok: false, error: "No response." });
+        } catch (err) {
+          const msgText = err instanceof Error ? err.message : "Extension context invalidated.";
+          if (/extension context invalidated/i.test(msgText)) markRuntimeInvalidated(msgText);
+          resolve({ ok: false, error: msgText });
+        }
+      });
+    } catch (err) {
+      const msgText = err instanceof Error ? err.message : "Extension context invalidated.";
+      if (/extension context invalidated/i.test(msgText)) markRuntimeInvalidated(msgText);
+      resolve({ ok: false, error: msgText });
+    }
   });
+}
+
+function markRuntimeInvalidated(message) {
+  PF_STATE.runtimeInvalidated = true;
+  if (PF_STATE.runtimeInvalidatedNotified) return;
+  PF_STATE.runtimeInvalidatedNotified = true;
+  try {
+    toast("Prompt Firewall updated. Refresh this tab to re-enable protection.", 4500);
+  } catch {
+    // no-op
+  }
+  try {
+    console.warn("[Prompt Firewall]", message);
+  } catch {
+    // no-op
+  }
 }
 
 async function appendResolution(payload) {
@@ -921,19 +1649,12 @@ async function maybeRequireHumanVerification(text) {
 
   if (now < PF_STATE.humanVerifiedUntil) return true;
 
-  const fastAfterPaste = PF_STATE.lastPasteAt > 0 && now - PF_STATE.lastPasteAt < 300;
-  const burstSends = PF_STATE.sendBurst.length >= 5;
   const repeats = PF_STATE.repeatSendCount >= 3;
-  const suspicious = burstSends || repeats || fastAfterPaste;
+  // Burst / paste-to-send verification now runs in background as STEP_UP L1.
+  const suspicious = repeats;
   if (!suspicious) return true;
 
-  const reason = burstSends
-    ? "rapid sends"
-    : repeats
-      ? "repeated prompt pattern"
-      : fastAfterPaste
-        ? "paste-to-send too fast"
-        : "behavioral signal";
+  const reason = repeats ? "repeated prompt pattern" : "behavioral signal";
 
   const ok = await showMicroChallengeModal({ reason });
   if (ok) {
@@ -1296,4 +2017,3 @@ function escHtml(value) {
     }
   });
 }
-
