@@ -11,6 +11,10 @@ It detects sensitive data and prompt-injection patterns in real time, then appli
 
 It is designed to be practical for hackathon demos and realistic enough to show how browser-side prompt security can work without breaking the user workflow.
 
+Quick links:
+
+- [Sample Inputs & Use Cases](./SAMPLE_INPUTS.md) (ready-to-demo prompts for `ALLOW` / `AUTO_REDACT` / `BLOCK` / `STEP_UP`)
+
 ## Why This Project Exists (Inspiration)
 
 Modern AI assistants are now part of everyday work:
@@ -526,6 +530,10 @@ The local server accepts `POST` JSON and returns:
 It logs metadata (domain, hop index, transform, lengths) to the terminal.
 
 ## How to Demo This Project (Suggested Flow)
+
+For a larger action-by-action demo script (including L1/L2 triggers, challenge rotation, and judge narration), see:
+
+- [Sample Inputs & Use Cases](./SAMPLE_INPUTS.md)
 
 ### 1) Baseline allow
 
