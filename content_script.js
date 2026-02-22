@@ -242,9 +242,26 @@ async function handleSend({ editable, originalText, triggerMeta }) {
 
       if (choice === "STEP_UP_VERIFIED") {
         const isL2 = decisionStepUpLevel === 2;
-        const finalText = isL2
-          ? (proxyHops ? textToSend : (redactedText || originalText))
-          : (proxyHops ? textToSend : originalText);
+        let finalText = proxyHops ? textToSend : originalText;
+        if (isL2) {
+          const safe = getL2SafeSendText({ redactedText, proxyHops, proxyText: textToSend });
+          if (!safe.ok) {
+            toast("L2 verified, but redacted text is unavailable. Send blocked.");
+            await appendResolution({
+              action: "STEP_UP_L2_FAIL_CLOSED",
+              risk: analysis.risk,
+              categories: analysis.categories,
+              counts: analysis.counts,
+              reasonCodes: decisionReasonCodes,
+              stepUpLevel: decisionStepUpLevel || undefined,
+              stepUpChallengeType: decisionStepUpChallengeType || undefined,
+              automation: analysis?.automation || undefined,
+              note: "L2 verification passed but redacted text missing; fail-closed.",
+            });
+            return;
+          }
+          finalText = safe.text;
+        }
         await executeSend(editable, finalText, triggerMeta);
         if (isL2) await storeVaultEntries(redactions);
         await appendResolution({
@@ -354,6 +371,39 @@ async function handleSend({ editable, originalText, triggerMeta }) {
             categories: analysis.categories,
             counts: analysis.counts,
             note: "Secret flow: policy denied secret override.",
+          });
+          return;
+        }
+        if (decisionStepUpLevel === 2) {
+          const safe = getL2SafeSendText({ redactedText, proxyHops, proxyText: textToSend });
+          if (!safe.ok) {
+            toast("L2 verified, but redacted text is unavailable. Send blocked.");
+            await appendResolution({
+              action: "OVERRIDE_FAIL_CLOSED",
+              risk: analysis.risk,
+              categories: analysis.categories,
+              counts: analysis.counts,
+              reasonCodes: decisionReasonCodes,
+              stepUpLevel: 2,
+              stepUpChallengeType: decisionStepUpChallengeType || undefined,
+              automation: analysis?.automation || undefined,
+              note: "Blocked raw send after L2 because redacted text missing.",
+            });
+            return;
+          }
+          toast("L2 verified. Safety policy sent redacted text instead of original.");
+          await executeSend(editable, safe.text, triggerMeta);
+          await storeVaultEntries(redactions);
+          await appendResolution({
+            action: "OVERRIDE_REDIRECTED_TO_REDACTED",
+            risk: analysis.risk,
+            categories: analysis.categories,
+            counts: analysis.counts,
+            reasonCodes: decisionReasonCodes,
+            stepUpLevel: 2,
+            stepUpChallengeType: decisionStepUpChallengeType || undefined,
+            automation: analysis?.automation || undefined,
+            note: "L2 safety guarantee redirected override to redacted send.",
           });
           return;
         }
@@ -472,6 +522,39 @@ async function handleSend({ editable, originalText, triggerMeta }) {
           categories: analysis.categories,
           counts: analysis.counts,
           note: "Policy denied secret override.",
+        });
+        return;
+      }
+      if (decisionStepUpLevel === 2) {
+        const safe = getL2SafeSendText({ redactedText, proxyHops, proxyText: textToSend });
+        if (!safe.ok) {
+          toast("L2 verified, but redacted text is unavailable. Send blocked.");
+          await appendResolution({
+            action: "OVERRIDE_FAIL_CLOSED",
+            risk: analysis.risk,
+            categories: analysis.categories,
+            counts: analysis.counts,
+            reasonCodes: decisionReasonCodes,
+            stepUpLevel: 2,
+            stepUpChallengeType: decisionStepUpChallengeType || undefined,
+            automation: analysis?.automation || undefined,
+            note: "Blocked raw send after L2 because redacted text missing.",
+          });
+          return;
+        }
+        toast("L2 verified. Safety policy sent redacted text instead of original.");
+        await executeSend(editable, safe.text, triggerMeta);
+        await storeVaultEntries(redactions);
+        await appendResolution({
+          action: "OVERRIDE_REDIRECTED_TO_REDACTED",
+          risk: analysis.risk,
+          categories: analysis.categories,
+          counts: analysis.counts,
+          reasonCodes: decisionReasonCodes,
+          stepUpLevel: 2,
+          stepUpChallengeType: decisionStepUpChallengeType || undefined,
+          automation: analysis?.automation || undefined,
+          note: "L2 safety guarantee redirected override to redacted send.",
         });
         return;
       }
@@ -621,6 +704,12 @@ function getTimeSinceLastPasteMs() {
   const delta = Date.now() - PF_STATE.lastPasteAt;
   if (!Number.isFinite(delta) || delta < 0) return null;
   return delta > 600000 ? null : delta;
+}
+
+function getL2SafeSendText({ redactedText, proxyHops, proxyText }) {
+  if (proxyHops && Array.isArray(proxyHops) && proxyHops.length > 0) return { ok: true, text: proxyText || "" };
+  if (typeof redactedText === "string" && redactedText.length > 0) return { ok: true, text: redactedText };
+  return { ok: false, text: "" };
 }
 
 function normalizeReasonChips(reasons) {

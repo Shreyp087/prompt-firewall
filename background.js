@@ -79,7 +79,8 @@ const AUTOMATION_WINDOW_MS = 5000;
 const AUTOMATION_BURST_THRESHOLD = 4;
 const PASTE_SEND_TOO_FAST_MS = 250;
 const L1_STEPUP_HOLD_MS = 1200;
-const STEPUP_LAST_CHALLENGE_KEY = "stepup_last_challenge";
+const STEPUP_CHALLENGE_HISTORY_KEY = "stepup_challenge_history_v1";
+const DEMO_MODE_KEY = "demo_mode_v1";
 const L2_CHALLENGE_POOL = ["OTP", "SLIDER", "HOLD"];
 const L2_SENSITIVE_CATEGORIES = ["PRIVATE_KEY", "SECRET", "JWT", "SSN", "FINANCIAL"];
 const REASON_SEVERITY_RANK = { LOW: 1, MED: 2, HIGH: 3 };
@@ -1332,14 +1333,44 @@ function pickRotatingChallengeType(pool, lastType, rand = Math.random) {
   return options[idx];
 }
 
+function getDeterministicChallengeType(history) {
+  const seq = ["OTP", "SLIDER", "HOLD"];
+  const last = Array.isArray(history) && history.length > 0 ? String(history[0] || "") : "";
+  const idx = seq.indexOf(last);
+  if (idx < 0) return seq[0];
+  return seq[(idx + 1) % seq.length];
+}
+
+function pickChallengeTypeWithHistory(pool, history, rand = Math.random) {
+  const uniquePool = Array.from(new Set((Array.isArray(pool) ? pool : []).map((t) => String(t || "")).filter(Boolean)));
+  if (uniquePool.length === 0) return "HOLD";
+
+  const recent = Array.isArray(history) ? history.map((t) => String(t || "")).filter(Boolean) : [];
+  const exclude2 = new Set(recent.slice(0, 2));
+  let options = uniquePool.filter((t) => !exclude2.has(t));
+  if (options.length === 0) {
+    const exclude1 = new Set(recent.slice(0, 1));
+    options = uniquePool.filter((t) => !exclude1.has(t));
+  }
+  if (options.length === 0) options = uniquePool;
+  const idx = Math.max(0, Math.min(options.length - 1, Math.floor(Math.abs(rand()) * options.length)));
+  return options[idx];
+}
+
 async function selectRotatingL2Challenge(domain, primaryCategory) {
   const key = `${String(domain || "unknown")}|${String(primaryCategory || "UNKNOWN")}`;
-  const { [STEPUP_LAST_CHALLENGE_KEY]: raw } = await chrome.storage.local.get(STEPUP_LAST_CHALLENGE_KEY);
-  const store = raw && typeof raw === "object" ? { ...raw } : {};
-  const last = store[key];
-  const type = pickRotatingChallengeType(L2_CHALLENGE_POOL, last);
-  store[key] = type;
-  await chrome.storage.local.set({ [STEPUP_LAST_CHALLENGE_KEY]: store });
+  const { [STEPUP_CHALLENGE_HISTORY_KEY]: rawHistory, [DEMO_MODE_KEY]: demoModeRaw } = await chrome.storage.local.get([
+    STEPUP_CHALLENGE_HISTORY_KEY,
+    DEMO_MODE_KEY,
+  ]);
+  const store = rawHistory && typeof rawHistory === "object" ? { ...rawHistory } : {};
+  const history = Array.isArray(store[key]) ? store[key].map(String).filter(Boolean).slice(0, 2) : [];
+  const demoMode = Boolean(demoModeRaw);
+  const type = demoMode
+    ? getDeterministicChallengeType(history)
+    : pickChallengeTypeWithHistory(L2_CHALLENGE_POOL, history);
+  store[key] = [type, ...history.filter((t) => t !== type)].slice(0, 2);
+  await chrome.storage.local.set({ [STEPUP_CHALLENGE_HISTORY_KEY]: store });
   return { type, payload: buildStepUpChallengePayload(type) };
 }
 
@@ -1589,6 +1620,26 @@ function decideAction({ analysis, policy, effective, injectionResult }) {
 async function runPromptFirewallDevTests() {
   const nextType = pickRotatingChallengeType(["OTP", "SLIDER", "HOLD"], "OTP", () => 0);
   console.assert(nextType !== "OTP", "Rotation test failed: next challenge repeated OTP");
+  const histType = pickChallengeTypeWithHistory(["OTP", "SLIDER", "HOLD"], ["OTP", "SLIDER"], () => 0);
+  console.assert(histType === "HOLD", "Rotation history test failed: expected HOLD when OTP/SLIDER are recent");
+
+  console.assert(getDeterministicChallengeType([]) === "OTP", "Demo mode rotation test failed: expected OTP first");
+  console.assert(getDeterministicChallengeType(["OTP"]) === "SLIDER", "Demo mode rotation test failed: OTP -> SLIDER");
+  console.assert(getDeterministicChallengeType(["SLIDER"]) === "HOLD", "Demo mode rotation test failed: SLIDER -> HOLD");
+  console.assert(getDeterministicChallengeType(["HOLD"]) === "OTP", "Demo mode rotation test failed: HOLD -> OTP");
+
+  const sanitized = sanitizeLedgerEntry({
+    action: "STEP_UP",
+    domain: "chat.openai.com",
+    risk: 80,
+    text: "SHOULD_NOT_STORE",
+    prompt: "SHOULD_NOT_STORE",
+    originalText: "SHOULD_NOT_STORE",
+    redactedText: "[SECRET_1]",
+    reasonCodes: ["SECRET"],
+    stepUpChallengeType: "OTP",
+  });
+  console.assert(!("text" in sanitized) && !("prompt" in sanitized) && !("originalText" in sanitized), "Ledger sanitizer test failed");
 
   const burstDecision = await finalizeDecisionForResponse({
     domain: "chat.openai.com",
@@ -1627,43 +1678,67 @@ globalThis.__PF_RUN_DEV_TESTS__ = runPromptFirewallDevTests;
 // ─────────────────────────────────────────────
 //  Ledger
 // ─────────────────────────────────────────────
+function sanitizeLedgerEntry(entry) {
+  const src = entry && typeof entry === "object" ? entry : {};
+  const bannedKeys = new Set([
+    "text",
+    "prompt",
+    "raw",
+    "message",
+    "input",
+    "originalText",
+    "redactedText",
+    "content",
+    "body",
+  ]);
+  const out = {};
+  for (const [k, v] of Object.entries(src)) {
+    if (bannedKeys.has(k)) continue;
+    out[k] = v;
+  }
+  if (out.stepUpChallengeType && !out.challengeType) out.challengeType = out.stepUpChallengeType;
+  return out;
+}
+
 async function appendLedger(entry) {
+  const safeEntry = sanitizeLedgerEntry(entry);
   const { ledger } = await chrome.storage.local.get("ledger");
   const current = Array.isArray(ledger) ? ledger : [];
 
   const baseEntry = {
     id: crypto.randomUUID(),
     ts: Date.now(),
-    domain: String(entry.domain || "unknown"),
-    trigger: String(entry.trigger || "unknown"),
-    eventType: String(entry.eventType || "scan"),
-    action: String(entry.action || "INFO"),
-    risk: Number.isFinite(entry.risk) ? Number(entry.risk) : 0,
-    categories: Array.isArray(entry.categories) ? entry.categories.map(String) : [],
-    counts: entry.counts && typeof entry.counts === "object" ? entry.counts : {},
-    redactionCounts: entry.redactionCounts && typeof entry.redactionCounts === "object" ? entry.redactionCounts : {},
-    canOverride: typeof entry.canOverride === "boolean" ? entry.canOverride : undefined,
+    domain: String(safeEntry.domain || "unknown"),
+    trigger: String(safeEntry.trigger || "unknown"),
+    eventType: String(safeEntry.eventType || "scan"),
+    action: String(safeEntry.action || "INFO"),
+    risk: Number.isFinite(safeEntry.risk) ? Number(safeEntry.risk) : 0,
+    categories: Array.isArray(safeEntry.categories) ? safeEntry.categories.map(String) : [],
+    counts: safeEntry.counts && typeof safeEntry.counts === "object" ? safeEntry.counts : {},
+    redactionCounts: safeEntry.redactionCounts && typeof safeEntry.redactionCounts === "object" ? safeEntry.redactionCounts : {},
+    canOverride: typeof safeEntry.canOverride === "boolean" ? safeEntry.canOverride : undefined,
     automation:
-      entry.automation && typeof entry.automation === "object"
+      safeEntry.automation && typeof safeEntry.automation === "object"
         ? {
-            burst: Boolean(entry.automation.burst),
-            pasteSendTooFast: Boolean(entry.automation.pasteSendTooFast),
-            attemptsIn5s: Number.isFinite(entry.automation.attemptsIn5s) ? Number(entry.automation.attemptsIn5s) : undefined,
-            timeSincePasteMs: Number.isFinite(entry.automation.timeSincePasteMs) ? Number(entry.automation.timeSincePasteMs) : null,
+            burst: Boolean(safeEntry.automation.burst),
+            pasteSendTooFast: Boolean(safeEntry.automation.pasteSendTooFast),
+            attemptsIn5s: Number.isFinite(safeEntry.automation.attemptsIn5s) ? Number(safeEntry.automation.attemptsIn5s) : undefined,
+            timeSincePasteMs: Number.isFinite(safeEntry.automation.timeSincePasteMs) ? Number(safeEntry.automation.timeSincePasteMs) : null,
           }
         : undefined,
-    reasonCodes: Array.isArray(entry.reasonCodes) ? entry.reasonCodes.map(String) : [],
-    stepUpLevel: Number.isFinite(entry.stepUpLevel) ? Number(entry.stepUpLevel) : undefined,
-    stepUpChallengeType: entry.stepUpChallengeType ? String(entry.stepUpChallengeType) : undefined,
-    stepUpSuccess: typeof entry.stepUpSuccess === "boolean" ? entry.stepUpSuccess : undefined,
-    stepUpAttempted: typeof entry.stepUpAttempted === "boolean" ? entry.stepUpAttempted : undefined,
-    note: typeof entry.note === "string" ? entry.note : "",
-    findingFingerprints: Array.isArray(entry.findingFingerprints) ? entry.findingFingerprints : [],
-    injectionDetected: Boolean(entry.injectionDetected),
-    injectionSignals: Array.isArray(entry.injectionSignals) ? entry.injectionSignals : [],
-    enterpriseApplied: typeof entry.enterpriseApplied === "boolean" ? entry.enterpriseApplied : undefined,
-    enterprisePolicyName: entry.enterprisePolicyName ? String(entry.enterprisePolicyName) : undefined,
-    enterpriseReason: entry.enterpriseReason ? String(entry.enterpriseReason) : undefined,
+    reasonCodes: Array.isArray(safeEntry.reasonCodes) ? safeEntry.reasonCodes.map(String) : [],
+    stepUpLevel: Number.isFinite(safeEntry.stepUpLevel) ? Number(safeEntry.stepUpLevel) : undefined,
+    stepUpChallengeType: safeEntry.stepUpChallengeType ? String(safeEntry.stepUpChallengeType) : undefined,
+    challengeType: safeEntry.challengeType ? String(safeEntry.challengeType) : (safeEntry.stepUpChallengeType ? String(safeEntry.stepUpChallengeType) : undefined),
+    stepUpSuccess: typeof safeEntry.stepUpSuccess === "boolean" ? safeEntry.stepUpSuccess : undefined,
+    stepUpAttempted: typeof safeEntry.stepUpAttempted === "boolean" ? safeEntry.stepUpAttempted : undefined,
+    note: typeof safeEntry.note === "string" ? safeEntry.note : "",
+    findingFingerprints: Array.isArray(safeEntry.findingFingerprints) ? safeEntry.findingFingerprints : [],
+    injectionDetected: Boolean(safeEntry.injectionDetected),
+    injectionSignals: Array.isArray(safeEntry.injectionSignals) ? safeEntry.injectionSignals : [],
+    enterpriseApplied: typeof safeEntry.enterpriseApplied === "boolean" ? safeEntry.enterpriseApplied : undefined,
+    enterprisePolicyName: safeEntry.enterprisePolicyName ? String(safeEntry.enterprisePolicyName) : undefined,
+    enterpriseReason: safeEntry.enterpriseReason ? String(safeEntry.enterpriseReason) : undefined,
   };
 
   const prevHash = current.length > 0 ? String(current[0].entryHash || "") : "GENESIS";
